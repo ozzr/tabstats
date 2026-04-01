@@ -96,6 +96,14 @@ class TabStatConfig:
     # 'n_valid_percent'→ non-missing N (%)
     total_mode:           str  = "n_valid_percent"
 
+    # ── Percentage denominator for categorical variables ─────────────────────
+    # 'group'        → % of the column (group) non-missing total  [default, standard]
+    # 'total'        → % of grand total N (all subjects in the table)
+    # 'parent_group' → for ≥2 grouping variables, % within the first-level group.
+    #                  Example: "CASECLASSIF + FATAL" → % within Compatible or Confirmed.
+    #                  Falls back to 'group' for single grouping variable.
+    pct_denominator:      str  = "group"
+
     # ── Symbols / indentation ───────────────────────────────────────────────
     missing_value_symbol: str  = "NA"
     indent_char:          str  = "\u2800"   # Braille blank (visually safe)
