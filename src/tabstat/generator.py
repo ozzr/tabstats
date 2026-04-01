@@ -85,9 +85,12 @@ class TabStatGenerator:
         self,
         df: pd.DataFrame,
         formula: str,
-        output_format: str = "df",   # 'df' | 'markdown' | 'latex' | 'grid' | 'html'
+        output_format: str = "df",
         column_labels: Optional[Dict[str, str]] = None,
         paired: bool = False,
+        title: Optional[str] = None,
+        footnote: Optional[str] = None,
+        show_subtotals: bool = False,
     ) -> Union[pd.DataFrame, str]:
         """
         Generate Table 1.
@@ -100,20 +103,23 @@ class TabStatGenerator:
 
         Parameters
         ----------
-        df             : source DataFrame
-        formula        : R-style formula string
-        output_format  : 'df' returns DataFrame; others print a formatted string
-        column_labels  : rename variables or group levels in the output
-        paired         : use paired tests (McNemar, Wilcoxon signed-rank, paired-t)
+        df              : source DataFrame
+        formula         : R-style formula string
+        output_format   : 'df' | 'grid' | 'markdown' | 'latex' | 'html'
+        column_labels   : rename variables or group values in the output
+        paired          : use paired statistical tests
+        title           : optional title rendered above the table
+        footnote        : optional footnote rendered below the table
+        show_subtotals  : add a row at the bottom with N per group column
         """
+        from .rendering import build_col_layout, render_text_table
+
         variables, group_cols = self._parse_formula(df, formula)
         self._validate_dataframe(df, variables, group_cols)
 
-        # Pre-compute group structure once
-        groups        = self._get_groups(df, group_cols)
-        group_counts  = self._compute_group_counts(df, group_cols, groups)
+        groups       = self._get_groups(df, group_cols)
+        group_counts = self._compute_group_counts(df, group_cols, groups)
 
-        # Build rows
         rows: List[List[Any]] = []
         for var in variables:
             try:
@@ -126,47 +132,83 @@ class TabStatGenerator:
                     var_rows = self._summarize_categorical(
                         df, var, group_cols, groups, paired=paired
                     )
-                # Apply variable label remapping to first-row label
                 if column_labels and var_rows:
                     key = var_rows[0][0]
                     var_rows[0][0] = column_labels.get(key, key)
                 rows.extend(var_rows)
             except Exception as exc:
-                logger.warning(
-                    "Failed to summarize variable '%s': %s", var, exc
-                )
+                logger.warning("Failed to summarize variable '%s': %s", var, exc)
 
-        # Build column index
-        columns = self._build_columns(df, group_cols, groups, group_counts)
+        columns   = self._build_columns(df, group_cols, groups, group_counts)
+        n_cols    = len(columns)
+        norm_rows = self._normalize_rows(rows, n_cols)
+        result_df = pd.DataFrame(norm_rows, columns=columns)
 
-        # Assemble DataFrame
-        n_cols       = len(columns)
-        norm_rows    = self._normalize_rows(rows, n_cols)
-        result_df    = pd.DataFrame(norm_rows, columns=columns)
-
-        # Remap column labels
         if column_labels:
             if isinstance(result_df.columns, pd.MultiIndex):
                 result_df.columns = pd.MultiIndex.from_tuples(
-                    [
-                        tuple(column_labels.get(str(c), c) for c in col)
-                        for col in result_df.columns
-                    ]
+                    [tuple(column_labels.get(str(c), c) for c in col)
+                     for col in result_df.columns]
                 )
             else:
                 result_df.rename(columns=column_labels, inplace=True)
 
-        # Return / format
         if output_format == "df":
             return result_df
 
         if output_format == "html":
             from .exports import to_html_str
-            return to_html_str(result_df)
+            return to_html_str(result_df,
+                               title=title or "Table 1",
+                               footnote=footnote)
+
+        # ── Text output (grid / markdown / latex / …) ────────────────────
+        cfg = self.config
+        col_layout = build_col_layout(
+            group_cols        = group_cols,
+            groups            = groups,
+            display_overall   = cfg.display_overall,
+            overall_position  = cfg.overall_position,
+            display_p_values  = cfg.display_p_values,
+            display_test_name = cfg.display_test_name,
+            display_smd       = cfg.display_smd,
+        )
 
         flat_df = self._flatten_multiindex_columns(result_df)
-        return tabulate(
-            flat_df, headers="keys", tablefmt=output_format, showindex=False
+
+        subtotals_row: Optional[List[Any]] = None
+        if show_subtotals and group_cols:
+            subtotals_row = self._build_subtotals_row(
+                col_layout, groups, group_counts, len(df)
+            )
+
+        # Remap group names / values for the renderer if column_labels given
+        if column_labels:
+            render_groups = [
+                tuple(column_labels.get(str(v), str(v)) for v in g)
+                if isinstance(g, tuple)
+                else column_labels.get(str(g), str(g))
+                for g in groups
+            ]
+            render_counts = {rg: group_counts[og]
+                             for rg, og in zip(render_groups, groups)}
+            render_group_cols = [column_labels.get(gc, gc) for gc in group_cols]
+        else:
+            render_groups     = groups
+            render_counts     = group_counts
+            render_group_cols = group_cols
+
+        return render_text_table(
+            flat_df       = flat_df,
+            col_layout    = col_layout,
+            group_cols    = render_group_cols,
+            groups        = render_groups,
+            group_counts  = render_counts,
+            n_total       = len(df),
+            tablefmt      = output_format,
+            title         = title,
+            footnote      = footnote,
+            subtotals_row = subtotals_row,
         )
 
     # ─── Export helpers (convenience wrappers) ────────────────────────────
@@ -195,6 +237,31 @@ class TabStatGenerator:
         """Return LaTeX tabular string."""
         flat = self._flatten_multiindex_columns(df)
         return tabulate(flat, headers="keys", tablefmt="latex", showindex=False)
+
+    # ─── Subtotals ────────────────────────────────────────────────────────
+
+    def _build_subtotals_row(
+        self,
+        col_layout:   "ColLayout",
+        groups:       List[Any],
+        group_counts: Dict[Any, int],
+        n_total:      int,
+    ) -> List[Any]:
+        """
+        Build a subtotals row showing N per group column.
+        Matches the column structure defined by col_layout.
+
+        Result example (for 2-group table with Total and P-value):
+          ['N (subjects)', '', n1, n2, n3, n4, n_total, '', '']
+        """
+        from .rendering import ColLayout
+        row: List[Any] = [""] * col_layout.n_cols
+        row[col_layout.char_idx] = "N (subjects)"
+        for j, g in enumerate(groups):
+            row[col_layout.group_idxs[j]] = str(group_counts.get(g, "?"))
+        if col_layout.total_idx is not None:
+            row[col_layout.total_idx] = str(n_total)
+        return row
 
     # =========================================================================
     # Formula Parsing & Validation

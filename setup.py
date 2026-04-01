@@ -2,7 +2,7 @@
 
 setup(
     name="tabstat",
-    version="1.0.0",
+    version="1.0.1",
     author="Unknown",
     author_email="you@example.com",
     description="Publication-ready Table 1 for clinical and epidemiological research",

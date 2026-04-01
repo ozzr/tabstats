@@ -54,7 +54,7 @@ __all__ = [
     "TestResolver",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 logger = logging.getLogger(__name__)
 
@@ -63,64 +63,51 @@ def tabstat(
     df: pd.DataFrame,
     formula: str,
     *,
-    paired:        bool = False,
-    tablefmt:      str  = "df",     # 'df' | 'grid' | 'markdown' | 'latex' | 'html'
-    column_labels: Optional[Dict[str, str]] = None,
+    paired:         bool = False,
+    tablefmt:       str  = "df",
+    column_labels:  Optional[Dict[str, str]] = None,
+    title:          Optional[str] = None,
+    footnote:       Optional[str] = None,
+    show_subtotals: bool = False,
     **kwargs,
-) -> pd.DataFrame:
+) -> Union[pd.DataFrame, str]:
     """
     Generate a publication-ready Table 1.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Source data. Each row is one subject.
     formula : str
-        R-style formula:
-          "var1 + var2 | group"   — specific variables, one grouping column
-          "~ . | group"           — all columns except group
-          "~ ."                   — all columns, no stratification
+        "var1 + var2 | group"  /  "~ . | group"  /  "~ ."
     paired : bool
-        Use paired tests (McNemar, Wilcoxon signed-rank, paired-t).
     tablefmt : str
-        'df'       → return DataFrame only (no print)
-        'grid'     → print grid, return DataFrame
-        'markdown' → print markdown, return DataFrame
-        'latex'    → print LaTeX tabular, return DataFrame
-        'html'     → return HTML string (not printed)
-    column_labels : dict, optional
-        Rename variables or group values in the output.
-        {'creat': 'Creatinine', 'outcome': 'Fatal outcome'}
+        'df' → DataFrame only (no print)
+        'grid' | 'markdown' | 'latex' → print + return DataFrame
+        'html' → return HTML string
+    column_labels : dict
+        Rename variables or group values: {'creat': 'Creatinine', 0: 'Survivor'}
+    title : str
+        Optional table title (shown above in text/HTML output).
+    footnote : str
+        Optional footnote (shown below in text/HTML output).
+    show_subtotals : bool
+        If True, append a 'N (subjects)' row at the bottom with counts per column.
     **kwargs
-        Any field of TabStatConfig:
+        Any TabStatConfig field:
           decimals, p_decimals, display_smd, display_missing,
           collapse_binary, render_config, render_continuous,
-          test_overrides (TestOverrideConfig instance or preset name), …
+          test_overrides (TestOverrideConfig or preset string), …
 
     Returns
     -------
-    pd.DataFrame
-        The Table 1 as a DataFrame (always returned regardless of tablefmt).
-
-    Examples
-    --------
-    >>> from tabstat import tabstat, TestOverrideConfig
-    >>> df_t1 = tabstat(
-    ...     df, "~ . | outcome",
-    ...     tablefmt       = "grid",
-    ...     display_smd    = True,
-    ...     test_overrides = TestOverrideConfig.preset("clinical_descriptive"),
-    ... )
+    pd.DataFrame  (always), or str for 'html' tablefmt.
     """
-    # ── Build config from kwargs ──────────────────────────────────────────
     known_fields = set(TabStatConfig.__dataclass_fields__.keys())
     config_kwargs = {}
-
     for k, v in kwargs.items():
         if k not in known_fields:
             logger.warning("Unknown TabStatConfig field ignored: '%s'", k)
             continue
-        # Allow passing preset name as string for test_overrides
         if k == "test_overrides" and isinstance(v, str):
             v = TestOverrideConfig.preset(v)
         config_kwargs[k] = v
@@ -128,24 +115,32 @@ def tabstat(
     config = TabStatConfig(**config_kwargs)
     gen    = TabStatGenerator(config)
 
-    result_df = gen.generate(
-        df, formula,
-        output_format  = "df",
-        column_labels  = column_labels,
-        paired         = paired,
-    )
-
     if tablefmt == "html":
-        from .exports import to_html_str
-        return to_html_str(result_df)
+        return gen.generate(
+            df, formula,
+            output_format  = "html",
+            column_labels  = column_labels,
+            paired         = paired,
+            title          = title,
+            footnote       = footnote,
+        )
 
     if tablefmt != "df":
+        # Print formatted + return DataFrame
         formatted = gen.generate(
             df, formula,
             output_format  = tablefmt,
             column_labels  = column_labels,
             paired         = paired,
+            title          = title,
+            footnote       = footnote,
+            show_subtotals = show_subtotals,
         )
         print(formatted)
 
-    return result_df
+    return gen.generate(
+        df, formula,
+        output_format  = "df",
+        column_labels  = column_labels,
+        paired         = paired,
+    )
