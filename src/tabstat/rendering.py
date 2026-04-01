@@ -193,7 +193,7 @@ def _label_cells(col_layout: ColLayout, n_cols: int) -> List[str]:
     cells = [""] * n_cols
     cells[col_layout.char_idx] = "Characteristic"
     if col_layout.total_idx   is not None: cells[col_layout.total_idx]  = "Total"
-    if col_layout.p_idx       is not None: cells[col_layout.p_idx]      = "P-value"
+    if col_layout.p_idx       is not None: cells[col_layout.p_idx]      = "p-val"
     if col_layout.test_idx    is not None: cells[col_layout.test_idx]   = "Test"
     if col_layout.smd_idx     is not None: cells[col_layout.smd_idx]    = "SMD"
     return cells
