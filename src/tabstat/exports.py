@@ -1,0 +1,258 @@
+"""
+tabstat/exports.py
+──────────────────
+Export functions for Table 1 DataFrames.
+
+Formats supported
+─────────────────
+  to_html_str()   → styled HTML string (Word-paste compatible)
+  to_excel_file() → openpyxl workbook with header styling and alternating rows
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HTML_CSS = """
+<style>
+  body   { font-family: Arial, sans-serif; font-size: 11pt; color: #1a1a1a; }
+  table  { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  caption{
+    font-size: 13pt; font-weight: bold;
+    text-align: left; margin-bottom: 8px; padding: 4px 0;
+  }
+  th {
+    background: #2c3e50; color: #ffffff;
+    padding: 8px 12px; text-align: center;
+    border: 1px solid #aab4bb; white-space: nowrap;
+  }
+  th:first-child { text-align: left; }
+  td {
+    padding: 5px 12px; border: 1px solid #d0d7de;
+    vertical-align: top;
+  }
+  td:first-child  { text-align: left;   }
+  td:not(:first-child) { text-align: center; }
+  tr:nth-child(even) td { background: #f4f6f8; }
+  tr:hover           td { background: #dceeff; }
+  tfoot td { font-style: italic; font-size: 9pt; color: #555; border-top: 2px solid #2c3e50; }
+</style>
+"""
+
+
+def to_html_str(
+    df: pd.DataFrame,
+    title: str = "Table 1. Characteristics of the study population",
+    footnote: Optional[str] = None,
+) -> str:
+    """
+    Convert a Table 1 DataFrame to a styled, self-contained HTML string.
+
+    Parameters
+    ----------
+    df        : output of TabStatGenerator.generate()
+    title     : table caption shown above the table
+    footnote  : optional footnote rendered in <tfoot>
+
+    Returns
+    -------
+    str — complete HTML document.
+    """
+    flat = _flatten(df)
+    n_cols = len(flat.columns)
+
+    # thead
+    header_html = "<thead><tr>" + "".join(
+        f"<th>{col}</th>" for col in flat.columns
+    ) + "</tr></thead>"
+
+    # tbody
+    tbody_rows = []
+    for _, row in flat.iterrows():
+        cells = "".join(f"<td>{_safe(v)}</td>" for v in row)
+        tbody_rows.append(f"<tr>{cells}</tr>")
+    body_html = "<tbody>" + "\n".join(tbody_rows) + "</tbody>"
+
+    # tfoot
+    foot_html = ""
+    if footnote:
+        foot_html = (
+            f'<tfoot><tr><td colspan="{n_cols}">{footnote}</td></tr></tfoot>'
+        )
+
+    table_html = (
+        f'<table>\n'
+        f'  <caption>{title}</caption>\n'
+        f'  {header_html}\n'
+        f'  {body_html}\n'
+        f'  {foot_html}\n'
+        f'</table>'
+    )
+
+    return (
+        "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
+        "<meta charset='UTF-8'>\n"
+        f"<title>{title}</title>\n"
+        f"{_HTML_CSS}"
+        "</head>\n<body>\n"
+        f"{table_html}\n"
+        "</body>\n</html>"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_excel_file(
+    df: pd.DataFrame,
+    path: str,
+    title: str = "Table 1",
+) -> None:
+    """
+    Export Table 1 to a styled Excel workbook.
+
+    Requires
+    --------
+    openpyxl  (pip install openpyxl)
+
+    Features
+    --------
+    - Title row (row 1)
+    - Multi-level header rows (one row per MultiIndex level, if applicable)
+    - Alternating-row fill
+    - Auto-fitted column widths (capped at 40 characters)
+    - Frozen top rows
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import (
+            Alignment, Border, Font, PatternFill, Side,
+        )
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise ImportError(
+            "openpyxl is required for Excel export. "
+            "Install with:  pip install openpyxl"
+        ) from exc
+
+    flat_df   = _flatten(df)
+    n_data_cols = len(flat_df.columns)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Table 1"
+
+    # ── Styles ────────────────────────────────────────────────────────────
+    thin_side = Side(style="thin", color="BDC3C7")
+    border    = Border(
+        left=thin_side, right=thin_side,
+        top=thin_side,  bottom=thin_side,
+    )
+    hdr_fill   = PatternFill("solid", fgColor="2C3E50")
+    hdr_font   = Font(bold=True, color="FFFFFF", size=11, name="Arial")
+    alt_fill   = PatternFill("solid", fgColor="F4F6F8")
+    title_font = Font(bold=True, size=13, name="Arial")
+    body_font  = Font(size=11, name="Arial")
+    center_aln = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    left_aln   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+
+    current_row = 1
+
+    # ── Title row ─────────────────────────────────────────────────────────
+    ws.append([title] + [""] * (n_data_cols - 1))
+    ws.merge_cells(
+        start_row=current_row, start_column=1,
+        end_row=current_row,   end_column=n_data_cols,
+    )
+    ws.cell(current_row, 1).font      = title_font
+    ws.cell(current_row, 1).alignment = left_aln
+    current_row += 1
+
+    # ── Header row(s) ─────────────────────────────────────────────────────
+    is_multi = isinstance(df.columns, pd.MultiIndex)
+    if is_multi:
+        n_levels = df.columns.nlevels
+        for lvl in range(n_levels):
+            row_vals = [str(col[lvl]) if str(col[lvl]).strip() else "" for col in df.columns]
+            ws.append(row_vals)
+            for col_idx, val in enumerate(row_vals, start=1):
+                cell = ws.cell(current_row, col_idx)
+                cell.value     = val
+                cell.fill      = hdr_fill
+                cell.font      = hdr_font
+                cell.border    = border
+                cell.alignment = center_aln if col_idx > 1 else left_aln
+            current_row += 1
+    else:
+        ws.append(list(flat_df.columns))
+        for col_idx, val in enumerate(flat_df.columns, start=1):
+            cell = ws.cell(current_row, col_idx)
+            cell.fill      = hdr_fill
+            cell.font      = hdr_font
+            cell.border    = border
+            cell.alignment = center_aln if col_idx > 1 else left_aln
+        current_row += 1
+
+    # Freeze panes below headers
+    ws.freeze_panes = ws.cell(current_row, 1)
+
+    # ── Data rows ─────────────────────────────────────────────────────────
+    for r_idx, row_data in enumerate(flat_df.itertuples(index=False)):
+        ws.append([str(v) if v is not None else "" for v in row_data])
+        fill = alt_fill if r_idx % 2 == 1 else None
+        for col_idx in range(1, n_data_cols + 1):
+            cell           = ws.cell(current_row, col_idx)
+            cell.border    = border
+            cell.font      = body_font
+            cell.alignment = left_aln if col_idx == 1 else center_aln
+            if fill:
+                cell.fill = fill
+        current_row += 1
+
+    # ── Auto column widths ────────────────────────────────────────────────
+    for col_idx in range(1, n_data_cols + 1):
+        max_len    = 0
+        col_letter = get_column_letter(col_idx)
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if cell.value:
+                    # count longest line in wrapped text
+                    lines = str(cell.value).split("\n")
+                    max_len = max(max_len, max(len(ln) for ln in lines))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 42)
+
+    wb.save(path)
+    logger.info("Saved Excel file → %s", path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flatten(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns to single-level strings."""
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            "\n".join(
+                str(c) for c in col
+                if c and str(c).strip() not in ("", " ")
+            )
+            for col in out.columns.values
+        ]
+    return out
+
+
+def _safe(value: object) -> str:
+    """Convert value to HTML-safe string."""
+    s = str(value) if value is not None else ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
