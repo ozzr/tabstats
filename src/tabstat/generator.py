@@ -125,6 +125,13 @@ class TabStatGenerator:
             df, formula, column_labels, paired
         )
 
+        # ── Optional data quality checks ─────────────────────────────────
+        if self.config.check_outliers or self.config.check_multimodal:
+            variables_for_checks, _ = self._parse_formula(df, formula)
+            quality_footnotes = self._run_data_quality_checks(df, variables_for_checks)
+            if quality_footnotes:
+                footnote = "\n".join(filter(None, [footnote] + quality_footnotes)) if footnote else "\n".join(quality_footnotes)
+
         # ── DataFrame output ──────────────────────────────────────────────
         if output_format == "df":
             return self._attach_title_footnote(result_df, title, footnote)
@@ -311,6 +318,57 @@ class TabStatGenerator:
                 is_middle = (k == middle_k)
                 injections.append((k, p_str, test_str, is_middle))
         return injections
+
+    def _run_data_quality_checks(
+        self, df: pd.DataFrame, variables: List[str]
+    ) -> List[str]:
+        """
+        Run optional Tukey outlier and Hartigan Dip Test checks on numeric variables.
+        Returns a list of footnote strings (may be empty).
+        """
+        footnotes: List[str] = []
+
+        numeric_vars = [
+            v for v in variables
+            if v in df.columns and pd.api.types.is_numeric_dtype(df[v])
+        ]
+
+        if self.config.check_outliers:
+            outlier_vars = []
+            for v in numeric_vars:
+                s = df[v].dropna()
+                if len(s) < 4:
+                    continue
+                q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                iqr = q3 - q1
+                lo, hi = q1 - 3 * iqr, q3 + 3 * iqr
+                if ((s < lo) | (s > hi)).any():
+                    outlier_vars.append(v)
+            if outlier_vars:
+                footnotes.append(f"[*] Outliers detected in: {', '.join(outlier_vars)}")
+
+        if self.config.check_multimodal:
+            try:
+                import diptest  # type: ignore
+                multimodal_vars = []
+                for v in numeric_vars:
+                    s = df[v].dropna().values
+                    if len(s) < 4:
+                        continue
+                    _, pval = diptest.diptest(s)
+                    if pval < 0.05:
+                        multimodal_vars.append(v)
+                if multimodal_vars:
+                    footnotes.append(
+                        f"[\u2020] Multimodal distribution detected in: {', '.join(multimodal_vars)}"
+                    )
+            except ImportError:
+                logger.warning(
+                    "check_multimodal=True but 'diptest' package is not installed; "
+                    "skipping Hartigan Dip Test."
+                )
+
+        return footnotes
 
     def _attach_title_footnote(
         self,

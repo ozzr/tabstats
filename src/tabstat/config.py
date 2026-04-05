@@ -133,6 +133,10 @@ class TabStatConfig:
         default_factory=list
     )
 
+    # ── Data quality checks ─────────────────────────────────────────────────
+    check_outliers:   bool = False   # Tukey far-outlier detection
+    check_multimodal: bool = False   # Hartigan Dip Test (requires diptest)
+
     # ── Statistical test override hierarchy ─────────────────────────────────
     test_overrides: TestOverrideConfig = field(
         default_factory=TestOverrideConfig
