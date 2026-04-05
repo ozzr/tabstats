@@ -1,5 +1,5 @@
 """
-tabstat  v1.1.0
+tabstat  v1.1.1
 ───────────────
 Publication-ready Table 1 for clinical and epidemiological research.
 
@@ -47,7 +47,7 @@ __all__ = [
     "TestResolver",
 ]
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 logger = logging.getLogger(__name__)
 
