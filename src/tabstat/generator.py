@@ -291,10 +291,11 @@ class TabStatGenerator:
 
     def _get_pvalue_injections(
         self, row_metas: List[Dict]
-    ) -> List[Tuple[int, str, str]]:
+    ) -> List[Tuple[int, str, str, bool]]:
         """
-        Convert RowMeta pvalue_span entries into (row_k, p_str, test_str) tuples.
+        Convert RowMeta pvalue_span entries into (row_k, p_str, test_str, is_middle) tuples.
         row_k is the flat_df row index AFTER which the separator gets the p-value.
+        is_middle is True only for the central separator row.
         """
         injections = []
         for meta in row_metas:
@@ -304,12 +305,11 @@ class TabStatGenerator:
             p_str, test_str, cat_start_abs, n_cats = span
             if not p_str and not test_str:
                 continue
-            # Inject into the separator after the middle category row
-            for i in range(n_cats - 1):          # separadores entre categorías
+            middle_k = cat_start_abs + (n_cats - 1) // 2
+            for i in range(n_cats - 1):
                 k = cat_start_abs + i
-                is_middle = (i == (n_cats - 1) // 2 - (1 if n_cats % 2 == 0 else 0))
-                # más simple: is_middle = (k == cat_start_abs + (n_cats - 1) // 2)
-                injections.append((k, p_str, test_str, k == cat_start_abs + (n_cats - 1) // 2))
+                is_middle = (k == middle_k)
+                injections.append((k, p_str, test_str, is_middle))
         return injections
 
     def _attach_title_footnote(

@@ -104,12 +104,14 @@ def _inject_pvalue_into_separator(
     def _replace(parts, idx, text):
         if idx is None or idx >= len(parts):
             return
-        if text == "":          # ← dejar guiones intactos (test en filas no-middle)
-            return
         w = len(parts[idx])
         inner = w - 2
-        display = str(text).strip()[:inner]
-        parts[idx] = f" {display.center(inner)} "
+        if str(text).strip() == "":
+            # blank: replace dashes with spaces (open cell)
+            parts[idx] = " " * w
+        else:
+            display = str(text).strip()
+            parts[idx] = f" {display.center(inner)} "
 
     _replace(parts, col_layout.p_idx,    p_str)
     _replace(parts, col_layout.test_idx, test_str)
@@ -365,9 +367,8 @@ def render_text_table(
                         lines[sep_line_idx], col_layout, p_str, test_str
                     )
                 else:
-                    # Solo abre (blanquea) la columna p, test queda con guiones
                     lines[sep_line_idx] = _inject_pvalue_into_separator(
-                        lines[sep_line_idx], col_layout, " ", ""
+                        lines[sep_line_idx], col_layout, " ", " "
                     )
 
     # ── Step 4: build nested header rows ─────────────────────────────────
