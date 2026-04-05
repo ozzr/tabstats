@@ -104,8 +104,10 @@ def _inject_pvalue_into_separator(
     def _replace(parts, idx, text):
         if idx is None or idx >= len(parts):
             return
-        w = len(parts[idx])            # total width of the segment
-        inner = w - 2                  # subtract 2 for padding spaces
+        if text == "":          # ← dejar guiones intactos (test en filas no-middle)
+            return
+        w = len(parts[idx])
+        inner = w - 2
         display = str(text).strip()[:inner]
         parts[idx] = f" {display.center(inner)} "
 
@@ -354,12 +356,19 @@ def render_text_table(
     # ── Step 3: inject p-values into separator lines ─────────────────────
     # Separator after data row k is at line index: header_sep_idx + 2 + k*2
     if pvalue_injections and col_layout.p_idx is not None:
-        for k, p_str, test_str in pvalue_injections:
+        for k, p_str, test_str, is_middle in pvalue_injections:
             sep_line_idx = header_sep_idx + 2 + k * 2
             if 0 <= sep_line_idx < len(lines):
-                lines[sep_line_idx] = _inject_pvalue_into_separator(
-                    lines[sep_line_idx], col_layout, p_str, test_str
-                )
+                if is_middle:
+                    # Reemplaza p-col y test-col con valor real
+                    lines[sep_line_idx] = _inject_pvalue_into_separator(
+                        lines[sep_line_idx], col_layout, p_str, test_str
+                    )
+                else:
+                    # Solo abre (blanquea) la columna p, test queda con guiones
+                    lines[sep_line_idx] = _inject_pvalue_into_separator(
+                        lines[sep_line_idx], col_layout, " ", ""
+                    )
 
     # ── Step 4: build nested header rows ─────────────────────────────────
     header_lines = _build_header_lines(

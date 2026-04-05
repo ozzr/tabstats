@@ -305,8 +305,11 @@ class TabStatGenerator:
             if not p_str and not test_str:
                 continue
             # Inject into the separator after the middle category row
-            k = cat_start_abs + (n_cats - 1) // 2
-            injections.append((k, p_str, test_str))
+            for i in range(n_cats - 1):          # separadores entre categorías
+                k = cat_start_abs + i
+                is_middle = (i == (n_cats - 1) // 2 - (1 if n_cats % 2 == 0 else 0))
+                # más simple: is_middle = (k == cat_start_abs + (n_cats - 1) // 2)
+                injections.append((k, p_str, test_str, k == cat_start_abs + (n_cats - 1) // 2))
         return injections
 
     def _attach_title_footnote(
