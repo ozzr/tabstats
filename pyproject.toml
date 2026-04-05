@@ -30,7 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 excel = ["openpyxl>=3.0"]
-dev   = ["pytest", "build", "twine"]
+dev   = ["pytest", "pytest-cov", "build", "twine"]
+docs  = ["mkdocs", "mkdocs-material", "mkdocstrings[python]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -179,8 +179,19 @@ gen.to_html(result_df, path="table1.html", title="Table 1", footnote="...")
 
 ```python
 gen = TabStatGenerator(config)
-result = gen.generate(df, formula)
-gen.to_excel(result, path="table1.xlsx", title="Table 1")
+result = gen.generate(df, formula, title="Table 1", footnote="IQR = interquartile range.")
+gen.to_excel(result, path="table1.xlsx", title="Table 1", footnote="IQR = interquartile range.")
+```
+
+```python
+# Export multiple Table 1 outputs into one workbook.
+gen = TabStatGenerator(config)
+t1 = gen.generate(df, "age + sex | outcome", title="Table 1")
+t2 = gen.generate(df, "creat | outcome", title="Table 2")
+gen.to_excel_workbook([
+    ("AgeSex", t1),
+    ("Creatinine", t2),
+], path="table1_workbook.xlsx")
 ```
 
 ---

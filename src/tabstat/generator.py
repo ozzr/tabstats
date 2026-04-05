@@ -107,13 +107,13 @@ class TabStatGenerator:
         output_format : 'df' | 'grid' | 'markdown' | 'latex' | 'html'
         column_labels : rename variables or group values
         paired        : use paired tests
-        title         : optional title (box above for text; row in df)
-        footnote      : optional footnote (box below for text; row in df)
+        title         : optional title (box above for text; not a row in df)
+        footnote      : optional footnote (box below for text; not a row in df)
         show          : if True (default), print text formats to stdout
 
         Returns
         -------
-        pd.DataFrame  for 'df' (always contains title/footnote rows if provided)
+        pd.DataFrame  for 'df' (no title/footnote rows included)
         str           for 'html'
         pd.DataFrame  for text formats (printed if show=True; df also returned)
         """
@@ -146,7 +146,8 @@ class TabStatGenerator:
 
         # ── DataFrame output ──────────────────────────────────────────────
         if output_format == "df":
-            return self._attach_title_footnote(result_df, title, footnote)
+            decorated = self._decorate_df_output(result_df, row_metas, col_layout)
+            return self._attach_title_footnote(decorated, title, footnote)
 
         # ── HTML output ───────────────────────────────────────────────────
         if output_format == "html":
@@ -191,7 +192,8 @@ class TabStatGenerator:
         if show:
             print(text)
 
-        return self._attach_title_footnote(result_df, title, footnote)
+        decorated = self._decorate_df_output(result_df, row_metas, col_layout)
+        return self._attach_title_footnote(decorated, title, footnote)
 
     # ── Export helpers ────────────────────────────────────────────────────
 
@@ -207,10 +209,20 @@ class TabStatGenerator:
         return html
 
     def to_excel(self, df: pd.DataFrame, path: str,
-                 title: str = "Table 1") -> None:
+                 title: Optional[str] = "Table 1",
+                 footnote: Optional[str] = None) -> None:
         from .exports import to_excel_file
-        to_excel_file(df, path, title)
+        to_excel_file(df, path, title=title, footnote=footnote)
         logger.info("Excel written to %s", path)
+
+    def to_excel_workbook(
+        self,
+        tables: List[Tuple[str, pd.DataFrame]],
+        path: str,
+    ) -> None:
+        from .exports import to_excel_file
+        to_excel_file(tables, path)
+        logger.info("Excel workbook written to %s", path)
 
     def to_latex(self, df: pd.DataFrame) -> str:
         flat = self._flatten_multiindex_columns(df)
@@ -413,6 +425,36 @@ class TabStatGenerator:
                 )
 
         return footnotes
+
+    def _decorate_df_output(
+        self,
+        df: pd.DataFrame,
+        row_metas: List[Dict],
+        col_layout,
+    ) -> pd.DataFrame:
+        """Return a DataFrame suitable for DataFrame output only.
+
+        This decorates categorical variable header rows with the p-value
+        and test name so the returned DataFrame contains the same test
+        metadata shown in the text rendering.
+        """
+        if col_layout.p_idx is None:
+            return df
+
+        out = df.copy()
+        for row_idx, meta in enumerate(row_metas):
+            if meta.get("kind") != "var_header":
+                continue
+            span = meta.get("pvalue_span")
+            if span is None:
+                continue
+            p_str, test_str, *_ = span
+            if p_str and col_layout.p_idx < out.shape[1]:
+                out.iat[row_idx, col_layout.p_idx] = p_str
+            if (test_str and col_layout.test_idx is not None
+                    and col_layout.test_idx < out.shape[1]):
+                out.iat[row_idx, col_layout.test_idx] = test_str
+        return out
 
     def _attach_title_footnote(
         self,

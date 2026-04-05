@@ -81,7 +81,7 @@ def tabstat(
     paired : bool
         Use paired tests (McNemar, Wilcoxon signed-rank, paired-t).
     tablefmt : str
-        ``'df'``       → return DataFrame (title/footnote as rows; no print).
+        ``'df'``       → return DataFrame (no title/footnote rows; no print).
         ``'grid'``     → print grid + return DataFrame.
         ``'markdown'`` → print markdown + return DataFrame.
         ``'latex'``    → print LaTeX + return DataFrame.
@@ -93,10 +93,10 @@ def tabstat(
         Rename variables or group values: ``{'CREAT': 'Creatinine', 0: 'Survivor'}``.
     title : str, optional
         Table title.  For text formats: rendered as a box above the table.
-        For 'df': prepended as a row in the Characteristic column.
+        For 'df': not included as a row in the DataFrame.
     footnote : str, optional
         Table footnote.  For text formats: rendered as a box below the table.
-        For 'df': appended as a row in the Characteristic column.
+        For 'df': not included as a row in the DataFrame.
     **kwargs : TabStatConfig fields
         Any field of :class:`TabStatConfig`:
 

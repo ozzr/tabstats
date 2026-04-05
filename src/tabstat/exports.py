@@ -11,7 +11,7 @@ Formats supported
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -113,9 +113,10 @@ def to_html_str(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def to_excel_file(
-    df: pd.DataFrame,
+    df_or_tables: Union[pd.DataFrame, List[Tuple[str, pd.DataFrame]]],
     path: str,
-    title: str = "Table 1",
+    title: Optional[str] = "Table 1",
+    footnote: Optional[str] = None,
 ) -> None:
     """
     Export Table 1 to a styled Excel workbook.
@@ -144,95 +145,146 @@ def to_excel_file(
             "Install with:  pip install openpyxl"
         ) from exc
 
-    flat_df   = _flatten(df)
-    n_data_cols = len(flat_df.columns)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Table 1"
-
     # ── Styles ────────────────────────────────────────────────────────────
     thin_side = Side(style="thin", color="BDC3C7")
     border    = Border(
         left=thin_side, right=thin_side,
         top=thin_side,  bottom=thin_side,
     )
-    hdr_fill   = PatternFill("solid", fgColor="2C3E50")
-    hdr_font   = Font(bold=True, color="FFFFFF", size=11, name="Arial")
-    alt_fill   = PatternFill("solid", fgColor="F4F6F8")
-    title_font = Font(bold=True, size=13, name="Arial")
+    hdr_font   = Font(bold=True, size=11, name="Arial")
     body_font  = Font(size=11, name="Arial")
-    center_aln = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    center_aln = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_aln   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
 
-    current_row = 1
+    def _write_table(
+        ws,
+        table_df: pd.DataFrame,
+        table_title: Optional[str],
+        table_footnote: Optional[str],
+    ) -> None:
+        flat_df   = _flatten(table_df)
+        n_data_cols = len(flat_df.columns)
 
-    # ── Title row ─────────────────────────────────────────────────────────
-    ws.append([title] + [""] * (n_data_cols - 1))
-    ws.merge_cells(
-        start_row=current_row, start_column=1,
-        end_row=current_row,   end_column=n_data_cols,
-    )
-    ws.cell(current_row, 1).font      = title_font
-    ws.cell(current_row, 1).alignment = left_aln
-    current_row += 1
+        if len(flat_df) > 0:
+            first_row = flat_df.iloc[0].astype(str)
+            if first_row.iloc[0].strip() and all(first_row.iloc[1:].str.strip() == ""):
+                if table_title is None:
+                    table_title = first_row.iloc[0]
+                if str(first_row.iloc[0]).strip() == str(table_title).strip():
+                    flat_df = flat_df.iloc[1:]
+        if len(flat_df) > 0:
+            last_row = flat_df.iloc[-1].astype(str)
+            if last_row.iloc[0].strip() and all(last_row.iloc[1:].str.strip() == ""):
+                if table_footnote is None:
+                    table_footnote = last_row.iloc[0]
+                if str(last_row.iloc[0]).strip() == str(table_footnote).strip():
+                    flat_df = flat_df.iloc[:-1]
 
-    # ── Header row(s) ─────────────────────────────────────────────────────
-    is_multi = isinstance(df.columns, pd.MultiIndex)
-    if is_multi:
-        n_levels = df.columns.nlevels
-        for lvl in range(n_levels):
-            row_vals = [str(col[lvl]) if str(col[lvl]).strip() else "" for col in df.columns]
-            ws.append(row_vals)
-            for col_idx, val in enumerate(row_vals, start=1):
+        current_row = 1
+
+        if table_title:
+            ws.append([table_title] + [""] * (n_data_cols - 1))
+            ws.merge_cells(
+                start_row=current_row, start_column=1,
+                end_row=current_row,   end_column=n_data_cols,
+            )
+            ws.cell(current_row, 1).font      = Font(bold=True, size=12, name="Arial")
+            ws.cell(current_row, 1).alignment = left_aln
+            current_row += 1
+
+        is_multi = isinstance(table_df.columns, pd.MultiIndex)
+        if is_multi:
+            n_levels = table_df.columns.nlevels
+            for lvl in range(n_levels):
+                row_vals = [str(col[lvl]) if str(col[lvl]).strip() else "" for col in table_df.columns]
+                ws.append(row_vals)
+                row_number = current_row
+                for col_idx, val in enumerate(row_vals, start=1):
+                    cell = ws.cell(row_number, col_idx)
+                    cell.value     = val
+                    cell.font      = hdr_font
+                    cell.border    = border
+                    cell.alignment = center_aln if col_idx > 1 else left_aln
+
+                merge_start = None
+                last_val = None
+                for col_idx, val in enumerate(row_vals + [None], start=1):
+                    if val and val == last_val:
+                        if merge_start is None:
+                            merge_start = col_idx - 1
+                    else:
+                        if merge_start is not None:
+                            end_col = col_idx - 1
+                            if end_col > merge_start:
+                                ws.merge_cells(
+                                    start_row=row_number, start_column=merge_start,
+                                    end_row=row_number, end_column=end_col,
+                                )
+                            merge_start = None
+                    last_val = val
+                current_row += 1
+        else:
+            ws.append(list(flat_df.columns))
+            for col_idx, val in enumerate(flat_df.columns, start=1):
                 cell = ws.cell(current_row, col_idx)
                 cell.value     = val
-                cell.fill      = hdr_fill
                 cell.font      = hdr_font
                 cell.border    = border
                 cell.alignment = center_aln if col_idx > 1 else left_aln
             current_row += 1
-    else:
-        ws.append(list(flat_df.columns))
-        for col_idx, val in enumerate(flat_df.columns, start=1):
-            cell = ws.cell(current_row, col_idx)
-            cell.fill      = hdr_fill
-            cell.font      = hdr_font
-            cell.border    = border
-            cell.alignment = center_aln if col_idx > 1 else left_aln
-        current_row += 1
 
-    # Freeze panes below headers
-    ws.freeze_panes = ws.cell(current_row, 1)
+        ws.freeze_panes = ws.cell(current_row, 1)
 
-    # ── Data rows ─────────────────────────────────────────────────────────
-    for r_idx, row_data in enumerate(flat_df.itertuples(index=False)):
-        ws.append([str(v) if v is not None else "" for v in row_data])
-        fill = alt_fill if r_idx % 2 == 1 else None
+        for r_idx, row_data in enumerate(flat_df.itertuples(index=False)):
+            ws.append([str(v) if v is not None else "" for v in row_data])
+            for col_idx in range(1, n_data_cols + 1):
+                cell           = ws.cell(current_row, col_idx)
+                cell.border    = border
+                cell.font      = body_font
+                cell.alignment = left_aln if col_idx == 1 else center_aln
+            current_row += 1
+
+        if table_footnote:
+            ws.append([table_footnote] + [""] * (n_data_cols - 1))
+            ws.merge_cells(
+                start_row=current_row, start_column=1,
+                end_row=current_row,   end_column=n_data_cols,
+            )
+            footer_cell = ws.cell(current_row, 1)
+            footer_cell.font      = Font(italic=True, size=10, name="Arial")
+            footer_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            footer_cell.border    = Border(top=Side(style="thin", color="BDC3C7"))
+            current_row += 1
+
         for col_idx in range(1, n_data_cols + 1):
-            cell           = ws.cell(current_row, col_idx)
-            cell.border    = border
-            cell.font      = body_font
-            cell.alignment = left_aln if col_idx == 1 else center_aln
-            if fill:
-                cell.fill = fill
-        current_row += 1
+            max_len    = 0
+            col_letter = get_column_letter(col_idx)
+            for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    if cell.value:
+                        lines = str(cell.value).split("\n")
+                        max_len = max(max_len, max(len(ln) for ln in lines))
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 42)
 
-    # ── Auto column widths ────────────────────────────────────────────────
-    for col_idx in range(1, n_data_cols + 1):
-        max_len    = 0
-        col_letter = get_column_letter(col_idx)
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
-            for cell in row:
-                if cell.value:
-                    # count longest line in wrapped text
-                    lines = str(cell.value).split("\n")
-                    max_len = max(max_len, max(len(ln) for ln in lines))
-        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 42)
+    if isinstance(df_or_tables, list):
+        if not df_or_tables:
+            raise ValueError("No tables provided for Excel workbook export.")
+        wb = openpyxl.Workbook()
+        for idx, (sheet_name, table_df) in enumerate(df_or_tables):
+            if idx == 0:
+                ws = wb.active
+                ws.title = sheet_name[:31]
+            else:
+                ws = wb.create_sheet(title=sheet_name[:31])
+            _write_table(ws, table_df, table_title=None, table_footnote=None)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Table 1"
+        _write_table(ws, df_or_tables, table_title=title, table_footnote=footnote)
 
     wb.save(path)
     logger.info("Saved Excel file → %s", path)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
