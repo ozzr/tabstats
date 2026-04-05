@@ -133,6 +133,10 @@ class TabStatConfig:
         default_factory=list
     )
 
+    # ── Multiple testing correction ─────────────────────────────────────────
+    # 'none' | 'bonferroni' | 'fdr_bh'
+    correction: str = "none"
+
     # ── Data quality checks ─────────────────────────────────────────────────
     check_outliers:   bool = False   # Tukey far-outlier detection
     check_multimodal: bool = False   # Hartigan Dip Test (requires diptest)

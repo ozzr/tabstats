@@ -125,6 +125,18 @@ class TabStatGenerator:
             df, formula, column_labels, paired
         )
 
+        # ── Multiple testing correction footnote ─────────────────────────
+        if self.config.correction != "none":
+            corr_note = {
+                "bonferroni": "P-values adjusted using Bonferroni correction.",
+                "fdr_bh":     "P-values adjusted using Benjamini-Hochberg FDR.",
+            }.get(self.config.correction, "")
+            if corr_note:
+                footnote = (
+                    "\n".join(filter(None, [footnote, corr_note]))
+                    if footnote else corr_note
+                )
+
         # ── Optional data quality checks ─────────────────────────────────
         if self.config.check_outliers or self.config.check_multimodal:
             variables_for_checks, _ = self._parse_formula(df, formula)
@@ -267,6 +279,38 @@ class TabStatGenerator:
 
             except Exception as exc:
                 logger.warning("Failed to summarize '%s': %s", var, exc)
+
+        # ── Multiple testing correction ───────────────────────────────────
+        if self.config.correction != "none" and group_cols and self.config.display_p_values:
+            # Compute p_col index in each row (after char, optional overall-first, groups, optional overall-last)
+            p_col_idx = 1
+            if self.config.display_overall and self.config.overall_position == "first":
+                p_col_idx += 1
+            p_col_idx += len(groups)
+            if self.config.display_overall and self.config.overall_position == "last":
+                p_col_idx += 1
+
+            # Collect (meta_idx, raw_p) for entries that have a raw p-value
+            raw_p_entries = [
+                (i, meta["raw_p"])
+                for i, meta in enumerate(all_metas)
+                if meta.get("raw_p") is not None and not np.isnan(meta["raw_p"])
+            ]
+            if raw_p_entries:
+                indices, raw_vals = zip(*raw_p_entries)
+                corrected_vals = self._apply_correction(list(raw_vals))
+                for idx_in_metas, corrected_p in zip(indices, corrected_vals):
+                    meta = all_metas[idx_in_metas]
+                    p_fmt = self._format_p(corrected_p)
+                    if meta.get("pvalue_span") is not None:
+                        # Update pvalue_span tuple
+                        old = meta["pvalue_span"]
+                        meta["pvalue_span"] = (p_fmt, old[1], old[2], old[3])
+                    else:
+                        # Update row cell directly
+                        row = all_rows[idx_in_metas]
+                        if p_col_idx < len(row):
+                            row[p_col_idx] = p_fmt
 
         # Build DataFrame
         columns   = self._build_columns(df, group_cols, groups, group_counts)
@@ -578,10 +622,12 @@ class TabStatGenerator:
                 if cfg.display_overall and cfg.overall_position == "last":
                     row_s.append(val_overall)
 
+                raw_p_spec = None
                 if group_cols and cfg.display_p_values:
                     if idx == 0:
                         p, test = self._calculate_pvalue_numeric(
                             group_series, resolved_test, paired)
+                        raw_p_spec = p
                         row_s.append(self._format_p(p))
                         if cfg.display_test_name:
                             row_s.append(test)
@@ -598,7 +644,8 @@ class TabStatGenerator:
                         row_s.append("")
 
                 rows.append(row_s)
-                metas.append({"kind": "stat", "var": var, "pvalue_span": None})
+                metas.append({"kind": "stat", "var": var, "pvalue_span": None,
+                               "raw_p": raw_p_spec})
         else:
             metric = cfg.render_config.get(
                 var, cfg.render_config.get("default_numeric", "median_iqr"))
@@ -620,9 +667,11 @@ class TabStatGenerator:
             if cfg.display_overall and cfg.overall_position == "last":
                 row_s.append(val_overall)
 
+            raw_p_default = None
             if group_cols and cfg.display_p_values:
                 p, test = self._calculate_pvalue_numeric(
                     group_series, resolved_test, paired)
+                raw_p_default = p
                 row_s.append(self._format_p(p))
                 if cfg.display_test_name:
                     row_s.append(test)
@@ -633,7 +682,8 @@ class TabStatGenerator:
                     if len(groups) == 2 else "")
 
             rows.append(row_s)
-            metas.append({"kind": "stat", "var": var, "pvalue_span": None})
+            metas.append({"kind": "stat", "var": var, "pvalue_span": None,
+                           "raw_p": raw_p_default})
 
         if cfg.display_missing:
             miss = self._make_missing_row(df, var, group_cols, groups)
@@ -723,13 +773,15 @@ class TabStatGenerator:
                 row.append(smd_str)
 
             rows.append(row)
-            metas.append({"kind": "var_header", "var": var, "pvalue_span": None})
+            metas.append({"kind": "var_header", "var": var, "pvalue_span": None,
+                           "raw_p": p_value if group_cols else None})
 
             if cfg.display_missing:
                 miss = self._make_missing_row(df, var, group_cols, groups)
                 if miss is not None:
                     rows.append(miss)
-                    metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+                    metas.append({"kind": "missing", "var": var, "pvalue_span": None,
+                                   "raw_p": None})
 
             return rows, metas
 
@@ -745,7 +797,8 @@ class TabStatGenerator:
         span = None
         if group_cols and cfg.display_p_values and len(categories) >= 1:
             span = (p_str, test_name, 1, len(categories))
-        metas.append({"kind": "var_header", "var": var, "pvalue_span": span})
+        metas.append({"kind": "var_header", "var": var, "pvalue_span": span,
+                       "raw_p": p_value if group_cols else None})
 
         for cat in categories:
             row_cat = [self._indent(str(cat))]
@@ -1029,6 +1082,34 @@ class TabStatGenerator:
         if pd.isna(p):   return ""
         if p < 0.001:    return "<0.001"
         return f"{p:.{self.config.p_decimals}f}"
+
+    def _apply_correction(self, pvalues: List[float]) -> List[float]:
+        """Apply multiple testing correction to a list of raw p-values."""
+        import numpy as np
+        arr = np.array(pvalues, dtype=float)
+        method = self.config.correction
+
+        if method == "bonferroni":
+            return list(np.minimum(arr * len(arr), 1.0))
+
+        if method == "fdr_bh":
+            try:
+                from scipy.stats import false_discovery_control
+                return list(false_discovery_control(arr, method="bh"))
+            except ImportError:
+                pass
+            try:
+                from statsmodels.stats.multitest import multipletests
+                _, corrected, _, _ = multipletests(arr, method="fdr_bh")
+                return list(corrected)
+            except ImportError:
+                logger.warning(
+                    "fdr_bh correction requires scipy >= 1.11 or statsmodels; "
+                    "returning uncorrected p-values."
+                )
+                return pvalues
+
+        return pvalues
 
     def _indent(self, text):
         return (self.config.indent_char + " " * self.config.indent_width) + text
