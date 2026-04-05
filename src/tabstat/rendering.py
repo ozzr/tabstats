@@ -136,7 +136,7 @@ def _make_label_separator(cells: List[str], widths: List[int], fill_char="=") ->
         s = str(cell).strip() if cell else ""
         if s:
             cw = w - 2
-            parts.append(f" {s[:cw].center(cw)} ")
+            parts.append(f" {s.center(cw)} ")
         else:
             parts.append(fill_char * w)
     return "+" + "+".join(parts) + "+"
