@@ -132,6 +132,11 @@ def _make_separator(widths: List[int], char: str = "-") -> str:
     return "+" + "+".join(char * w for w in widths) + "+"
 
 
+def _make_custom_separator(widths: List[int], chars: List[str]) -> str:
+    parts = [chars[i] * w for i, w in enumerate(widths)]
+    return "+" + "+".join(parts) + "+"
+
+
 def _make_label_separator(cells: List[str], widths: List[int], fill_char="=") -> str:
     parts = []
     for cell, w in zip(cells, widths):
@@ -246,43 +251,45 @@ def _header_single_level(col_layout, group_cols, groups, group_counts, n_total, 
 
 
 def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, widths):
-    # Level-0 aggregation (first group_col value)
-    l0_groups: OrderedDict = OrderedDict()
-    for j, g in enumerate(groups):
-        key = g[0]
-        l0_groups.setdefault(key, []).append(j)
-    l0_counts = {k: sum(group_counts.get(groups[j], 0) for j in idxs)
-                 for k, idxs in l0_groups.items()}
-
     pre, post = _pre_post_spans(col_layout, groups)
+    n_levels = len(group_cols)
 
-    # Row 1 — level-0 spanning
-    spans = ([(i, 1, "") for i in pre]
-             + [(col_layout.group_idxs[idxs[0]], len(idxs),
-                 f"{k}  (n={l0_counts[k]})")
-                for k, idxs in l0_groups.items()]
-             + [(i, 1, "") for i in post])
-    row1  = _make_spanning_row(spans, widths)
+    header_rows: List[str] = []
+    level_separator = _make_custom_separator(
+        widths,
+        ["-" if i in col_layout.group_idxs else " " for i in range(len(widths))]
+    )
 
-    # Row 2 — label separator
-    row2 = _make_label_separator(_label_cells(col_layout, col_layout.n_cols),
-                                 widths, fill_char="=")
+    for lvl in range(n_levels - 1):
+        prefixes: OrderedDict = OrderedDict()
+        for j, g in enumerate(groups):
+            prefix = g[:lvl + 1] if isinstance(g, tuple) else (g,)
+            prefixes.setdefault(prefix, []).append(j)
 
-    # Row 3 — level-1 values
-    cells3 = [""] * col_layout.n_cols
+        spans = [(i, 1, "") for i in pre]
+        for prefix, idxs in prefixes.items():
+            count = sum(group_counts.get(groups[j], 0) for j in idxs)
+            label = f"{prefix[-1]}  (n={count})"
+            spans.append((col_layout.group_idxs[idxs[0]], len(idxs), label))
+        spans.extend([(i, 1, "") for i in post])
+
+        header_rows.append(_make_spanning_row(spans, widths))
+
+        if n_levels == 2 or lvl == n_levels - 3:
+            header_rows.append(_make_label_separator(
+                _label_cells(col_layout, col_layout.n_cols), widths, fill_char="-"
+            ))
+        else:
+            header_rows.append(level_separator)
+
+    cells_values = [""] * col_layout.n_cols
     for j, g in enumerate(groups):
-        cells3[col_layout.group_idxs[j]] = str(g[-1]) if isinstance(g, tuple) else str(g)
+        cells_values[col_layout.group_idxs[j]] = f"{g[-1]}  (n={group_counts.get(g, '?')})"
     if col_layout.total_idx is not None:
-        cells3[col_layout.total_idx] = f"(n={n_total})"
-    row3 = _make_row(cells3, widths)
+        cells_values[col_layout.total_idx] = f"(n={n_total})"
+    header_rows.append(_make_row(cells_values, widths))
 
-    # Row 4 — n per group
-    cells4 = [""] * col_layout.n_cols
-    for j, g in enumerate(groups):
-        cells4[col_layout.group_idxs[j]] = f"(n={group_counts.get(g, '?')})"
-    row4 = _make_row(cells4, widths)
-
-    return [row1, row2, row3, row4]
+    return header_rows
 
 
 def _build_header_lines(col_layout, group_cols, groups, group_counts, n_total, widths):
