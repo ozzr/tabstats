@@ -29,8 +29,7 @@ Package layout
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Union
-
+from typing import Dict, List, Optional, Union, Tuple
 import pandas as pd
 
 from .config    import TabStatConfig, TestOverrideConfig
@@ -180,4 +179,32 @@ def tabstat(
         title          = title,
         footnote       = footnote,
         show           = show,
+    )
+
+def export_tables_to_excel(tables: List[Tuple[str, pd.DataFrame]], output_path:str="./report.xlsx"):
+    """
+    Export a collection of statistical tables into a single Excel workbook.
+
+    Parameters
+    ----------
+    tables : list of tuple
+        List of tuples with the format (sheet_name, tabstat_dataframe).
+        Example:
+        [
+            ("Table1", table_1),
+            ("Table2", table_2),
+            ...
+        ]
+    output_path : str, optional
+        Path to the output Excel file. Default is "./report.xlsx".
+
+    Returns
+    -------
+    None
+        Creates an Excel workbook with each table placed in a separate sheet.
+    """
+    
+    TabStatGenerator().to_excel_workbook(
+        tables,
+        output_path,
     )

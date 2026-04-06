@@ -183,13 +183,19 @@ def to_excel_file(
         current_row = 1
 
         if table_title:
-            ws.append([table_title] + [""] * (n_data_cols - 1))
+            for col_idx in range(1, n_data_cols + 1):
+                cell = ws.cell(current_row, col_idx)
+                if col_idx == 1:
+                    cell.value = table_title
+                    cell.font = Font(bold=True, size=12, name="Arial")
+                    cell.alignment = left_aln
+                else:
+                    cell.value = ""
+                cell.border = border
             ws.merge_cells(
                 start_row=current_row, start_column=1,
                 end_row=current_row,   end_column=n_data_cols,
             )
-            ws.cell(current_row, 1).font      = Font(bold=True, size=12, name="Arial")
-            ws.cell(current_row, 1).alignment = left_aln
             current_row += 1
 
         is_multi = isinstance(table_df.columns, pd.MultiIndex)
@@ -197,7 +203,6 @@ def to_excel_file(
             n_levels = table_df.columns.nlevels
             for lvl in range(n_levels):
                 row_vals = [str(col[lvl]) if str(col[lvl]).strip() else "" for col in table_df.columns]
-                ws.append(row_vals)
                 row_number = current_row
                 for col_idx, val in enumerate(row_vals, start=1):
                     cell = ws.cell(row_number, col_idx)
@@ -224,7 +229,6 @@ def to_excel_file(
                     last_val = val
                 current_row += 1
         else:
-            ws.append(list(flat_df.columns))
             for col_idx, val in enumerate(flat_df.columns, start=1):
                 cell = ws.cell(current_row, col_idx)
                 cell.value     = val
@@ -233,16 +237,63 @@ def to_excel_file(
                 cell.alignment = center_aln if col_idx > 1 else left_aln
             current_row += 1
 
-        ws.freeze_panes = ws.cell(current_row, 1)
+        p_col = flat_df.columns.get_loc("P-value") if "P-value" in flat_df.columns else None
+        test_col = flat_df.columns.get_loc("Test") if "Test" in flat_df.columns else None
+        data_rows = [list(row) for row in flat_df.itertuples(index=False)]
+        merge_ranges = []
 
-        for r_idx, row_data in enumerate(flat_df.itertuples(index=False)):
-            ws.append([str(v) if v is not None else "" for v in row_data])
-            for col_idx in range(1, n_data_cols + 1):
-                cell           = ws.cell(current_row, col_idx)
-                cell.border    = border
-                cell.font      = body_font
+        if p_col is not None or test_col is not None:
+            row_count = len(data_rows)
+            idx = 0
+            while idx < row_count:
+                label = data_rows[idx][0]
+                if isinstance(label, str) and label and not label.startswith("⠀"):
+                    next_idx = idx + 1
+                    if next_idx < row_count and isinstance(data_rows[next_idx][0], str) and data_rows[next_idx][0].startswith("⠀"):
+                        last_cat = next_idx
+                        while last_cat + 1 < row_count:
+                            next_label = data_rows[last_cat + 1][0]
+                            if not (isinstance(next_label, str) and next_label.startswith("⠀")):
+                                break
+                            next_label_text = str(next_label).replace("⠀", "").strip()
+                            if next_label_text == "Missing":
+                                break
+                            last_cat += 1
+
+                        if p_col is not None and data_rows[idx][p_col]:
+                            data_rows[next_idx][p_col] = data_rows[idx][p_col]
+                            data_rows[idx][p_col] = ""
+                            if last_cat > next_idx:
+                                merge_ranges.append((next_idx, last_cat, p_col))
+
+                        if test_col is not None and data_rows[idx][test_col]:
+                            data_rows[next_idx][test_col] = data_rows[idx][test_col]
+                            data_rows[idx][test_col] = ""
+                            if last_cat > next_idx:
+                                merge_ranges.append((next_idx, last_cat, test_col))
+                idx += 1
+
+        ws.freeze_panes = ws.cell(current_row, 1)
+        first_data_row = current_row
+
+        for row_idx, row_data in enumerate(data_rows, start=first_data_row):
+            for col_idx, value in enumerate(row_data, start=1):
+                cell = ws.cell(row_idx, col_idx)
+                cell.value = str(value) if value is not None else ""
+                cell.border = border
+                cell.font = body_font
                 cell.alignment = left_aln if col_idx == 1 else center_aln
             current_row += 1
+
+        for start_idx, end_idx, col_idx in merge_ranges:
+            ws.merge_cells(
+                start_row=first_data_row + start_idx,
+                start_column=col_idx + 1,
+                end_row=first_data_row + end_idx,
+                end_column=col_idx + 1,
+            )
+            merged_cell = ws.cell(first_data_row + start_idx, col_idx + 1)
+            merged_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         if table_footnote:
             ws.append([table_footnote] + [""] * (n_data_cols - 1))
