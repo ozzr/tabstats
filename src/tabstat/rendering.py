@@ -33,13 +33,14 @@ import pandas as pd
 
 @dataclass
 class ColLayout:
-    n_cols:     int
-    char_idx:   int                  = 0
-    total_idx:  Optional[int]        = None
-    group_idxs: List[int]            = field(default_factory=list)
-    p_idx:      Optional[int]        = None
-    test_idx:   Optional[int]        = None
-    smd_idx:    Optional[int]        = None
+    n_cols:          int
+    char_idx:        int                  = 0
+    total_idx:       Optional[int]        = None
+    group_idxs:      List[int]            = field(default_factory=list)
+    p_idx:           Optional[int]        = None
+    test_idx:        Optional[int]        = None
+    smd_idx:         Optional[int]        = None
+    split_count_pct: bool                 = False
 
 
 def build_col_layout(
@@ -50,17 +51,19 @@ def build_col_layout(
     display_p_values:  bool,
     display_test_name: bool,
     display_smd:       bool,
+    split_count_pct:   bool = False,
 ) -> ColLayout:
-    layout = ColLayout(n_cols=0)
+    layout = ColLayout(n_cols=0, split_count_pct=split_count_pct)
     idx = 1
+    cols_per_group = 2 if split_count_pct else 1
 
     if display_overall and overall_position == "first":
         layout.total_idx = idx
         idx += 1
 
     if groups:
-        layout.group_idxs = list(range(idx, idx + len(groups)))
-        idx += len(groups)
+        layout.group_idxs = list(range(idx, idx + len(groups) * cols_per_group, cols_per_group))
+        idx += len(groups) * cols_per_group
 
     if display_overall and overall_position == "last":
         layout.total_idx = idx
@@ -224,13 +227,14 @@ def _pre_post_spans(col_layout, groups):
 
 
 def _header_single_level(col_layout, group_cols, groups, group_counts, n_total, widths):
-    gc_name     = group_cols[0]
-    n_grp_total = sum(group_counts.get(g, 0) for g in groups)
-    pre, post   = _pre_post_spans(col_layout, groups)
+    gc_name      = group_cols[0]
+    n_grp_total  = sum(group_counts.get(g, 0) for g in groups)
+    pre, post    = _pre_post_spans(col_layout, groups)
+    cols_per_grp = 2 if col_layout.split_count_pct else 1
 
     # Row 1 — spanning
     spans = ([(i, 1, "") for i in pre]
-             + [(col_layout.group_idxs[0], len(groups),
+             + [(col_layout.group_idxs[0], cols_per_grp * len(groups),
                  f"{gc_name}  (n={n_grp_total})")]
              + [(i, 1, "") for i in post])
     row1  = _make_spanning_row(spans, widths)
@@ -239,26 +243,54 @@ def _header_single_level(col_layout, group_cols, groups, group_counts, n_total, 
     row2 = _make_label_separator(_label_cells(col_layout, col_layout.n_cols),
                                  widths, fill_char="=")
 
-    # Row 3 — group values with n
-    cells3 = [""] * col_layout.n_cols
-    for j, g in enumerate(groups):
-        cells3[col_layout.group_idxs[j]] = f"{g}  (n={group_counts.get(g, '?')})"
-    if col_layout.total_idx is not None:
-        cells3[col_layout.total_idx] = f"(n={n_total})"
-    row3 = _make_row(cells3, widths)
+    if col_layout.split_count_pct:
+        # Row 3 — group values spanning n+% sub-columns each
+        # Use just the group name (n= shown in data; col may be too narrow for full label)
+        spans3 = [(i, 1, "") for i in pre]
+        for j, g in enumerate(groups):
+            gi = col_layout.group_idxs[j]
+            spans3.append((gi, 2, str(g)))
+        for i in post:
+            content = f"(n={n_total})" if i == col_layout.total_idx else ""
+            spans3.append((i, 1, content))
+        row3 = _make_spanning_row(spans3, widths)
 
-    return [row1, row2, row3]
+        # Row 4 — n / % sub-column labels
+        cells4 = [""] * col_layout.n_cols
+        for j in range(len(groups)):
+            gi = col_layout.group_idxs[j]
+            cells4[gi]     = "n"
+            cells4[gi + 1] = "%"
+        row4 = _make_row(cells4, widths)
+        return [row1, row2, row3, row4]
+    else:
+        # Row 3 — group values with n
+        cells3 = [""] * col_layout.n_cols
+        for j, g in enumerate(groups):
+            cells3[col_layout.group_idxs[j]] = f"{g}  (n={group_counts.get(g, '?')})"
+        if col_layout.total_idx is not None:
+            cells3[col_layout.total_idx] = f"(n={n_total})"
+        row3 = _make_row(cells3, widths)
+        return [row1, row2, row3]
 
 
 def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, widths):
-    pre, post = _pre_post_spans(col_layout, groups)
-    n_levels = len(group_cols)
+    pre, post    = _pre_post_spans(col_layout, groups)
+    n_levels     = len(group_cols)
+    cols_per_grp = 2 if col_layout.split_count_pct else 1
 
     header_rows: List[str] = []
-    level_separator = _make_custom_separator(
-        widths,
-        ["-" if i in col_layout.group_idxs else " " for i in range(len(widths))]
-    )
+
+    # Build level separator: mark both sub-columns for each group when split
+    if col_layout.split_count_pct:
+        group_col_set = set()
+        for gi in col_layout.group_idxs:
+            group_col_set.add(gi)
+            group_col_set.add(gi + 1)
+        sep_chars = ["-" if i in group_col_set else " " for i in range(len(widths))]
+    else:
+        sep_chars = ["-" if i in col_layout.group_idxs else " " for i in range(len(widths))]
+    level_separator = _make_custom_separator(widths, sep_chars)
 
     for lvl in range(n_levels - 1):
         prefixes: OrderedDict = OrderedDict()
@@ -270,7 +302,7 @@ def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, w
         for prefix, idxs in prefixes.items():
             count = sum(group_counts.get(groups[j], 0) for j in idxs)
             label = f"{prefix[-1]}  (n={count})"
-            spans.append((col_layout.group_idxs[idxs[0]], len(idxs), label))
+            spans.append((col_layout.group_idxs[idxs[0]], cols_per_grp * len(idxs), label))
         spans.extend([(i, 1, "") for i in post])
 
         header_rows.append(_make_spanning_row(spans, widths))
@@ -282,12 +314,30 @@ def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, w
         else:
             header_rows.append(level_separator)
 
-    cells_values = [""] * col_layout.n_cols
-    for j, g in enumerate(groups):
-        cells_values[col_layout.group_idxs[j]] = f"{g[-1]}  (n={group_counts.get(g, '?')})"
-    if col_layout.total_idx is not None:
-        cells_values[col_layout.total_idx] = f"(n={n_total})"
-    header_rows.append(_make_row(cells_values, widths))
+    if col_layout.split_count_pct:
+        # Last header row: each group value spans 2 sub-columns
+        spans_final = [(i, 1, "") for i in pre]
+        for j, g in enumerate(groups):
+            gi = col_layout.group_idxs[j]
+            spans_final.append((gi, 2, str(g[-1])))
+        for i in post:
+            content = f"(n={n_total})" if i == col_layout.total_idx else ""
+            spans_final.append((i, 1, content))
+        header_rows.append(_make_spanning_row(spans_final, widths))
+
+        # n / % sub-column labels row
+        cells_np = [""] * col_layout.n_cols
+        for gi in col_layout.group_idxs:
+            cells_np[gi]     = "n"
+            cells_np[gi + 1] = "%"
+        header_rows.append(_make_row(cells_np, widths))
+    else:
+        cells_values = [""] * col_layout.n_cols
+        for j, g in enumerate(groups):
+            cells_values[col_layout.group_idxs[j]] = f"{g[-1]}  (n={group_counts.get(g, '?')})"
+        if col_layout.total_idx is not None:
+            cells_values[col_layout.total_idx] = f"(n={n_total})"
+        header_rows.append(_make_row(cells_values, widths))
 
     return header_rows
 
@@ -295,7 +345,11 @@ def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, w
 def _build_header_lines(col_layout, group_cols, groups, group_counts, n_total, widths):
     n_levels = len(group_cols)
     if n_levels == 0 or not groups:
-        return []
+        # No grouping: still render a plain header row for consistency
+        cells = _label_cells(col_layout, col_layout.n_cols)
+        if col_layout.total_idx is not None:
+            cells[col_layout.total_idx] = f"Total (n={n_total})"
+        return [_make_label_separator(cells, widths, fill_char="=")]
     if n_levels == 1:
         return _header_single_level(col_layout, group_cols, groups, group_counts,
                                     n_total, widths)

@@ -71,7 +71,7 @@ def to_html_str(
 
     # thead
     header_html = "<thead><tr>" + "".join(
-        f"<th>{col}</th>" for col in flat.columns
+        f"<th>{str(col).replace(chr(10), '<br>')}</th>" for col in flat.columns
     ) + "</tr></thead>"
 
     # tbody

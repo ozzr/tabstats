@@ -298,7 +298,7 @@ class TabStatGenerator:
             p_col_idx = 1
             if self.config.display_overall and self.config.overall_position == "first":
                 p_col_idx += 1
-            p_col_idx += len(groups)
+            p_col_idx += len(groups) * (2 if self.config.split_count_pct else 1)
             if self.config.display_overall and self.config.overall_position == "last":
                 p_col_idx += 1
 
@@ -348,6 +348,7 @@ class TabStatGenerator:
             display_p_values  = self.config.display_p_values,
             display_test_name = self.config.display_test_name,
             display_smd       = self.config.display_smd,
+            split_count_pct   = self.config.split_count_pct,
         )
 
         return result_df, all_metas, col_layout, group_cols, groups, group_counts
@@ -500,8 +501,14 @@ class TabStatGenerator:
             group_cols = []
 
         vars_part = vars_part.replace("~", "").strip()
-        if vars_part == ".":
-            exclude   = set(group_cols)
+        if vars_part.startswith("."):
+            exclude = set(group_cols)
+            rest = vars_part[1:].strip()
+            if rest:
+                for excl in rest.split("-"):
+                    excl = excl.strip()
+                    if excl:
+                        exclude.add(excl)
             variables = [c for c in df.columns if c not in exclude]
         else:
             variables = [t.strip() for t in vars_part.split("+") if t.strip()]
@@ -660,6 +667,8 @@ class TabStatGenerator:
                     group_series.append(subset)
                     row_s.append(self._compute_stat(subset, formula)
                                  if len(subset) > 0 else cfg.missing_value_symbol)
+                    if cfg.split_count_pct:
+                        row_s.append("")   # empty % cell for numeric rows
 
                 if cfg.display_overall and cfg.overall_position == "last":
                     row_s.append(val_overall)
@@ -705,6 +714,8 @@ class TabStatGenerator:
                 group_series.append(subset)
                 row_s.append(self._format_numeric_stats(subset, metric)
                              if len(subset) > 0 else cfg.missing_value_symbol)
+                if cfg.split_count_pct:
+                    row_s.append("")   # empty % cell for numeric rows
 
             if cfg.display_overall and cfg.overall_position == "last":
                 row_s.append(val_overall)
@@ -804,7 +815,11 @@ class TabStatGenerator:
                 denom = self._get_cat_denom(df, var, group_cols, g_tuple, parent_counts)
                 n_gc  = int((sub == cat).sum())
                 pct   = (n_gc / denom * 100) if denom > 0 else 0.0
-                row.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
+                if cfg.split_count_pct:
+                    row.append(str(n_gc))
+                    row.append(f"{pct:.{cfg.decimals}f}%")
+                else:
+                    row.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
             if cfg.display_overall and cfg.overall_position == "last":
                 row.append(val_ov)
             if group_cols and cfg.display_p_values:
@@ -858,7 +873,11 @@ class TabStatGenerator:
                 denom = self._get_cat_denom(df, var, group_cols, g_tuple, parent_counts)
                 n_gc  = int((sub == cat).sum())
                 pct   = (n_gc / denom * 100) if denom > 0 else 0.0
-                row_cat.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
+                if cfg.split_count_pct:
+                    row_cat.append(str(n_gc))
+                    row_cat.append(f"{pct:.{cfg.decimals}f}%")
+                else:
+                    row_cat.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
 
             if cfg.display_overall and cfg.overall_position == "last":
                 row_cat.append(val_ov)
@@ -895,7 +914,8 @@ class TabStatGenerator:
         if cfg.display_overall and cfg.overall_position == "first":
             row.append(overall_hdr)
         if group_cols:
-            row.extend([""] * len(groups))
+            empties = 2 if cfg.split_count_pct else 1
+            row.extend([""] * len(groups) * empties)
         if cfg.display_overall and cfg.overall_position == "last":
             row.append(overall_hdr)
         if group_cols and cfg.display_p_values:
@@ -923,7 +943,11 @@ class TabStatGenerator:
             sub      = df.loc[mask, var]
             n_miss_g = int(sub.isna().sum())
             pct_g    = (n_miss_g / len(sub) * 100) if len(sub) > 0 else 0.0
-            row.append(f"{n_miss_g} ({pct_g:.{cfg.decimals}f}%)")
+            if cfg.split_count_pct:
+                row.append(str(n_miss_g))
+                row.append(f"{pct_g:.{cfg.decimals}f}%")
+            else:
+                row.append(f"{n_miss_g} ({pct_g:.{cfg.decimals}f}%)")
         if cfg.display_overall and cfg.overall_position == "last":
             row.append(val_ov)
         if group_cols and cfg.display_p_values:
@@ -954,7 +978,11 @@ class TabStatGenerator:
                 final_cols.append(("Total", f"(n={len(df)})"))
             for g in groups:
                 n = group_counts.get(g, "?")
-                final_cols.append((grp_name, f"{g} (n={n})"))
+                if cfg.split_count_pct:
+                    final_cols.append((grp_name, f"{g} (n={n})", "n"))
+                    final_cols.append((grp_name, f"{g} (n={n})", "%"))
+                else:
+                    final_cols.append((grp_name, f"{g} (n={n})"))
             if cfg.display_overall and cfg.overall_position == "last":
                 final_cols.append(("Total", f"(n={len(df)})"))
             if cfg.display_p_values:
@@ -970,7 +998,11 @@ class TabStatGenerator:
                 final_cols.append(("Total",) + pad)
             for g in groups:
                 n = group_counts.get(g, "?")
-                final_cols.append(g + (f"(n={n})",))
+                if cfg.split_count_pct:
+                    final_cols.append(g + (f"(n={n})", "n"))
+                    final_cols.append(g + (f"(n={n})", "%"))
+                else:
+                    final_cols.append(g + (f"(n={n})",))
             if cfg.display_overall and cfg.overall_position == "last":
                 final_cols.append(("Total",) + pad)
             if cfg.display_p_values:
@@ -1091,7 +1123,7 @@ class TabStatGenerator:
         mode    = self.config.total_mode
         if mode == "n":          return str(n_total)
         if mode == "n_valid":    return str(n_valid)
-        return f"{n_valid} ({pct:.1f}%)"
+        return f"{n_valid} ({pct:.{self.config.decimals}f}%)"
 
     def _format_numeric_stats(self, data, metric):
         data = data.dropna()

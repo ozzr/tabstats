@@ -109,6 +109,11 @@ class TabStatConfig:
     indent_char:          str  = "\u2800"   # Braille blank (visually safe)
     indent_width:         int  = 3
 
+    # ── Count / percentage column splitting ─────────────────────────────────
+    # When True, categorical n and % are shown in separate sub-columns per group,
+    # matching the SPSS "split by columns" layout.
+    split_count_pct: bool = False
+
     # ── Binary variable collapsing ──────────────────────────────────────────
     # When True, a variable with exactly 2 categories is condensed to 1 row
     # (e.g. "Female, n (%)" instead of header + Male row + Female row).
