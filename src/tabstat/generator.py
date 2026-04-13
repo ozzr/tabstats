@@ -160,6 +160,11 @@ class TabStatGenerator:
         flat_df = self._flatten_multiindex_columns(result_df)
         pvalue_injections = self._get_pvalue_injections(row_metas)
 
+        # For non-grid formats: inject categorical p-values into var_header
+        # rows and use clean single-line column headers.
+        if output_format != "grid":
+            flat_df = self._prepare_flat_for_tabulate(flat_df, row_metas, col_layout)
+
         # Remap group names/values for the renderer when column_labels given
         if column_labels:
             render_groups = [
@@ -225,7 +230,7 @@ class TabStatGenerator:
         logger.info("Excel workbook written to %s", path)
 
     def to_latex(self, df: pd.DataFrame) -> str:
-        flat = self._flatten_multiindex_columns(df)
+        flat = self._flatten_for_tabulate(self._flatten_multiindex_columns(df))
         return tabulate(flat, headers="keys", tablefmt="latex", showindex=False)
 
     # =========================================================================
@@ -254,6 +259,8 @@ class TabStatGenerator:
         groups       = self._get_groups(df, group_cols)
         group_counts = self._compute_group_counts(df, group_cols, groups)
 
+        _var_labels, _val_maps = self._parse_column_labels(column_labels)
+
         all_rows:  List[List[Any]] = []
         all_metas: List[Dict]      = []
 
@@ -262,17 +269,15 @@ class TabStatGenerator:
                 vtype = self._get_render_type(df, var)
                 if vtype == "numeric":
                     var_rows, var_metas = self._summarize_numeric(
-                        df, var, group_cols, groups, paired=paired
+                        df, var, group_cols, groups, paired=paired,
+                        var_label=_var_labels.get(var),
                     )
                 else:
                     var_rows, var_metas = self._summarize_categorical(
-                        df, var, group_cols, groups, paired=paired
+                        df, var, group_cols, groups, paired=paired,
+                        var_label=_var_labels.get(var),
+                        val_map=_val_maps.get(var),
                     )
-
-                # Remap variable label
-                if column_labels and var_rows:
-                    key = var_rows[0][0]
-                    var_rows[0][0] = column_labels.get(key, key)
 
                 # Convert relative cat_offset → absolute cat_start_abs
                 base = len(all_rows)
@@ -561,8 +566,12 @@ class TabStatGenerator:
         if not group_cols:
             return []
         if len(group_cols) == 1:
-            unique = df[group_cols[0]].dropna().unique()
-            try:    return sorted(unique)
+            s = df[group_cols[0]].dropna()
+            if hasattr(s, "cat") and s.cat.ordered:
+                present = set(s.unique())
+                return [c for c in s.cat.categories if c in present]
+            unique = s.unique()
+            try:    return sorted(unique, key=self._natural_key)
             except: return sorted(str(v) for v in unique)
         else:
             df_clean = df.dropna(subset=group_cols)
@@ -633,6 +642,7 @@ class TabStatGenerator:
         group_cols: List[str],
         groups: List[Any],
         paired: bool = False,
+        var_label: Optional[str] = None,
     ) -> Tuple[List[List[Any]], List[Dict]]:
         """Returns (rows, metas)."""
         cfg           = self.config
@@ -643,7 +653,7 @@ class TabStatGenerator:
         overall_hdr   = self._calc_overall_header(df, var)
 
         # var_header row
-        row_main = self._make_header_row(var, overall_hdr, group_cols, groups)
+        row_main = self._make_header_row(var_label or var, overall_hdr, group_cols, groups)
         rows.append(row_main)
         metas.append({"kind": "var_header", "var": var, "pvalue_span": None})
 
@@ -658,7 +668,7 @@ class TabStatGenerator:
 
                 val_overall = self._compute_stat(df[var].dropna(), formula)
                 if cfg.display_overall and cfg.overall_position == "first":
-                    row_s.append(val_overall)
+                    self._append_total(row_s, hdr_str=val_overall)
 
                 group_series: List[pd.Series] = []
                 for g_tuple in groups:
@@ -671,7 +681,7 @@ class TabStatGenerator:
                         row_s.append("")   # empty % cell for numeric rows
 
                 if cfg.display_overall and cfg.overall_position == "last":
-                    row_s.append(val_overall)
+                    self._append_total(row_s, hdr_str=val_overall)
 
                 raw_p_spec = None
                 if group_cols and cfg.display_p_values:
@@ -705,7 +715,7 @@ class TabStatGenerator:
 
             val_overall = self._format_numeric_stats(df[var].dropna(), metric)
             if cfg.display_overall and cfg.overall_position == "first":
-                row_s.append(val_overall)
+                self._append_total(row_s, hdr_str=val_overall)
 
             group_series: List[pd.Series] = []
             for g_tuple in groups:
@@ -718,7 +728,7 @@ class TabStatGenerator:
                     row_s.append("")   # empty % cell for numeric rows
 
             if cfg.display_overall and cfg.overall_position == "last":
-                row_s.append(val_overall)
+                self._append_total(row_s, hdr_str=val_overall)
 
             raw_p_default = None
             if group_cols and cfg.display_p_values:
@@ -757,13 +767,24 @@ class TabStatGenerator:
         group_cols: List[str],
         groups: List[Any],
         paired: bool = False,
+        var_label: Optional[str] = None,
+        val_map: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[List[Any]], List[Dict]]:
         """Returns (rows, metas)."""
         cfg          = self.config
+        val_map      = val_map or {}
         rows: List   = []
         metas: List  = []
 
-        categories    = sorted(df[var].dropna().unique())
+        series = df[var].dropna()
+        if hasattr(series, "cat") and series.cat.ordered:
+            present = set(series.unique())
+            categories = [c for c in series.cat.categories if c in present]
+        else:
+            try:
+                categories = sorted(series.unique(), key=self._natural_key)
+            except Exception:
+                categories = sorted(str(c) for c in series.unique())
         is_binary     = len(categories) == 2
         overall_hdr   = self._calc_overall_header(df, var)
         resolved_test = self.test_resolver.resolve(var, group_cols, "categorical")
@@ -800,7 +821,7 @@ class TabStatGenerator:
         if is_binary and cfg.collapse_binary:
             cat   = (categories[-1] if cfg.collapse_binary_level == "last"
                      else categories[0])
-            label = f"{var}, {cat}"
+            label = f"{var_label or var}, {val_map.get(str(cat), str(cat))}"
             row   = [label]
 
             n_cat  = int((df[var] == cat).sum())
@@ -808,7 +829,7 @@ class TabStatGenerator:
             val_ov = f"{n_cat} ({pct_ov:.{cfg.decimals}f}%)"
 
             if cfg.display_overall and cfg.overall_position == "first":
-                row.append(val_ov)
+                self._append_total(row, n=n_cat, pct=pct_ov)
             for g_tuple in groups:
                 mask  = self._get_group_mask(df, group_cols, g_tuple)
                 sub   = df.loc[mask, var]
@@ -821,7 +842,7 @@ class TabStatGenerator:
                 else:
                     row.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
             if cfg.display_overall and cfg.overall_position == "last":
-                row.append(val_ov)
+                self._append_total(row, n=n_cat, pct=pct_ov)
             if group_cols and cfg.display_p_values:
                 row.append(p_str)
                 if cfg.display_test_name:
@@ -843,7 +864,7 @@ class TabStatGenerator:
             return rows, metas
 
         # ── Standard multi-row (header + one row per category) ───────────
-        row_main = self._make_header_row(var, overall_hdr, group_cols, groups)
+        row_main = self._make_header_row(var_label or var, overall_hdr, group_cols, groups)
         # SMD on the var_header (last column if display_smd)
         if group_cols and cfg.display_smd and smd_str:
             row_main[-1] = smd_str
@@ -858,14 +879,14 @@ class TabStatGenerator:
                        "raw_p": p_value if group_cols else None})
 
         for cat in categories:
-            row_cat = [self._indent(str(cat))]
+            row_cat = [self._indent(val_map.get(str(cat), str(cat)))]
 
             n_cat_tot = int((df[var] == cat).sum())
             pct_tot   = (n_cat_tot / n_valid_total * 100) if n_valid_total > 0 else 0.0
             val_ov    = f"{n_cat_tot} ({pct_tot:.{cfg.decimals}f}%)"
 
             if cfg.display_overall and cfg.overall_position == "first":
-                row_cat.append(val_ov)
+                self._append_total(row_cat, n=n_cat_tot, pct=pct_tot)
 
             for g_tuple in groups:
                 mask  = self._get_group_mask(df, group_cols, g_tuple)
@@ -880,7 +901,7 @@ class TabStatGenerator:
                     row_cat.append(f"{n_gc} ({pct:.{cfg.decimals}f}%)")
 
             if cfg.display_overall and cfg.overall_position == "last":
-                row_cat.append(val_ov)
+                self._append_total(row_cat, n=n_cat_tot, pct=pct_tot)
 
             # P-value and test: ALWAYS EMPTY in category rows
             # (they will be injected into the separator line by render_text_table)
@@ -908,16 +929,28 @@ class TabStatGenerator:
     # Row builders
     # =========================================================================
 
+    def _append_total(self, row, hdr_str=None, n=None, pct=None):
+        """Append 1 or 2 Total cells depending on split_count_pct."""
+        cfg = self.config
+        if cfg.split_count_pct:
+            row.append(str(n) if n is not None else (hdr_str or ""))
+            row.append(f"{pct:.{cfg.decimals}f}%" if pct is not None else "")
+        else:
+            if n is not None and pct is not None:
+                row.append(f"{n} ({pct:.{cfg.decimals}f}%)")
+            else:
+                row.append(hdr_str or "")
+
     def _make_header_row(self, label, overall_hdr, group_cols, groups):
         cfg = self.config
         row = [label]
         if cfg.display_overall and cfg.overall_position == "first":
-            row.append(overall_hdr)
+            self._append_total(row, hdr_str=overall_hdr)
         if group_cols:
             empties = 2 if cfg.split_count_pct else 1
             row.extend([""] * len(groups) * empties)
         if cfg.display_overall and cfg.overall_position == "last":
-            row.append(overall_hdr)
+            self._append_total(row, hdr_str=overall_hdr)
         if group_cols and cfg.display_p_values:
             row.append("")
             if cfg.display_test_name:
@@ -937,7 +970,7 @@ class TabStatGenerator:
 
         row = [self._indent("Missing")]
         if cfg.display_overall and cfg.overall_position == "first":
-            row.append(val_ov)
+            self._append_total(row, n=n_miss, pct=pct_ov)
         for g_tuple in groups:
             mask     = self._get_group_mask(df, group_cols, g_tuple)
             sub      = df.loc[mask, var]
@@ -949,7 +982,7 @@ class TabStatGenerator:
             else:
                 row.append(f"{n_miss_g} ({pct_g:.{cfg.decimals}f}%)")
         if cfg.display_overall and cfg.overall_position == "last":
-            row.append(val_ov)
+            self._append_total(row, n=n_miss, pct=pct_ov)
         if group_cols and cfg.display_p_values:
             row.append("")
             if cfg.display_test_name:
@@ -973,9 +1006,15 @@ class TabStatGenerator:
         final_cols = []
         if len(group_cols) == 1:
             grp_name = group_cols[0]
-            final_cols.append(("Characteristic", ""))
+            # extra empty level so all tuples are the same length when split
+            x = ("",) if cfg.split_count_pct else ()
+            final_cols.append(("Characteristic", "") + x)
             if cfg.display_overall and cfg.overall_position == "first":
-                final_cols.append(("Total", f"(n={len(df)})"))
+                if cfg.split_count_pct:
+                    final_cols.append(("Total", f"(n={len(df)})", "n"))
+                    final_cols.append(("Total", f"(n={len(df)})", "%"))
+                else:
+                    final_cols.append(("Total", f"(n={len(df)})"))
             for g in groups:
                 n = group_counts.get(g, "?")
                 if cfg.split_count_pct:
@@ -984,18 +1023,28 @@ class TabStatGenerator:
                 else:
                     final_cols.append((grp_name, f"{g} (n={n})"))
             if cfg.display_overall and cfg.overall_position == "last":
-                final_cols.append(("Total", f"(n={len(df)})"))
+                if cfg.split_count_pct:
+                    final_cols.append(("Total", f"(n={len(df)})", "n"))
+                    final_cols.append(("Total", f"(n={len(df)})", "%"))
+                else:
+                    final_cols.append(("Total", f"(n={len(df)})"))
             if cfg.display_p_values:
-                final_cols.append(("P-value", ""))
+                final_cols.append(("P-value", "") + x)
                 if cfg.display_test_name:
-                    final_cols.append(("Test", ""))
+                    final_cols.append(("Test", "") + x)
             if cfg.display_smd:
-                final_cols.append(("SMD", ""))
+                final_cols.append(("SMD", "") + x)
         else:
-            pad = ("",) * len(group_cols)
-            final_cols.append(("Characteristic",) + pad)
+            # pad fills all group-level positions; extra for split
+            pad  = ("",) * len(group_cols)
+            xpad = pad + (("",) if cfg.split_count_pct else ())
+            final_cols.append(("Characteristic",) + xpad)
             if cfg.display_overall and cfg.overall_position == "first":
-                final_cols.append(("Total",) + pad)
+                if cfg.split_count_pct:
+                    final_cols.append(("Total",) + pad + ("n",))
+                    final_cols.append(("Total",) + pad + ("%",))
+                else:
+                    final_cols.append(("Total",) + pad)
             for g in groups:
                 n = group_counts.get(g, "?")
                 if cfg.split_count_pct:
@@ -1004,11 +1053,15 @@ class TabStatGenerator:
                 else:
                     final_cols.append(g + (f"(n={n})",))
             if cfg.display_overall and cfg.overall_position == "last":
-                final_cols.append(("Total",) + pad)
+                if cfg.split_count_pct:
+                    final_cols.append(("Total",) + pad + ("n",))
+                    final_cols.append(("Total",) + pad + ("%",))
+                else:
+                    final_cols.append(("Total",) + pad)
             if cfg.display_p_values:
-                final_cols.append(("P-value",) + pad)
+                final_cols.append(("P-value",) + xpad)
                 if cfg.display_test_name:
-                    final_cols.append(("Test",) + pad)
+                    final_cols.append(("Test",) + xpad)
             if cfg.display_smd:
                 final_cols.append(("SMD",) + pad)
 
@@ -1201,3 +1254,67 @@ class TabStatGenerator:
                 for col in out.columns.values
             ]
         return out
+
+    _META_LABELS = {"Characteristic", "Total", "P-value", "Test", "SMD"}
+
+    @staticmethod
+    def _natural_key(s):
+        """Sort key that orders numeric substrings by value: '5-9' < '10-14'."""
+        return [int(t) if t.isdigit() else t.lower()
+                for t in re.split(r'(\d+)', str(s))]
+
+    @staticmethod
+    def _parse_column_labels(column_labels):
+        """
+        Normalize column_labels to (var_labels, val_maps).
+
+        Supports two formats:
+          Flat:   {"VARNAME": "Label", "group_val": "display"}
+          Nested: {"VARNAME": {"label": "Label", "map": {1: "Yes", 0: "No"}}}
+        Mixed dicts are allowed.
+        """
+        var_labels: Dict[str, str]             = {}
+        val_maps:   Dict[str, Dict[str, str]]  = {}
+        for k, v in (column_labels or {}).items():
+            k = str(k)
+            if isinstance(v, dict):
+                var_labels[k] = str(v.get("label", k))
+                val_maps[k]   = {str(mk): str(mv) for mk, mv in v.get("map", {}).items()}
+            else:
+                var_labels[k] = str(v)
+        return var_labels, val_maps
+
+    @staticmethod
+    def _flatten_for_tabulate(df):
+        """Clean single-line column names for non-grid tabulate output."""
+        if not isinstance(df.columns, pd.MultiIndex):
+            return df
+        out = df.copy()
+        meta = TabStatGenerator._META_LABELS
+        names = []
+        for col in out.columns.values:
+            parts = [str(c) for c in col if str(c).strip()]
+            if not parts:
+                names.append("")
+            elif len(parts) == 1:
+                names.append(parts[0])
+            elif parts[0] in meta:
+                names.append(" ".join(parts))
+            else:
+                names.append(parts[-1])
+        out.columns = names
+        return out
+
+    def _prepare_flat_for_tabulate(self, flat_df, row_metas, col_layout):
+        """Inject categorical p-values into var_header rows; clean column names."""
+        df = self._flatten_for_tabulate(flat_df)
+        for i, meta in enumerate(row_metas):
+            span = meta.get("pvalue_span")
+            if span is None:
+                continue
+            p_str, test_str = span[0], span[1]
+            if col_layout.p_idx is not None and p_str:
+                df.iloc[i, col_layout.p_idx] = p_str
+            if col_layout.test_idx is not None and test_str:
+                df.iloc[i, col_layout.test_idx] = test_str
+        return df

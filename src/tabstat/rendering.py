@@ -1,34 +1,32 @@
 """
 tabstat/rendering.py
 ─────────────────────
-Text-table rendering with nested headers, title, footnote, and
-SPSS-style p-value spanning for categorical variables.
+Canvas/grid text-table renderer.
+
+All rows (header + data) are first represented as structured cell objects.
+Column widths are computed from ALL content — headers and data alike — so
+header labels like "Alto Riesgo  (n=30)" can never be truncated by a narrow
+data column.
 
 P-value spanning
 ─────────────────
-For categorical variables with ≥2 categories the p-value is NOT
-placed inside a data cell.  Instead it is injected into the
-separator line between the middle category rows:
-
-    | ⠀   No   | 86 (63.2%)  |  ...  |        |               |
-    +----------+-------------+-------+ <0.001 + Chi-Squared   +
-    | ⠀   Yes  | 50 (36.8%)  |  ...  |        |               |
-
-This matches SPSS's spanning display and is produced by
-_inject_pvalue_into_separator() called from render_text_table().
+For categorical variables with ≥2 categories the p-value is injected into
+the separator line between category rows (SPSS-style spanning).  In the
+canvas model this is represented as a SCell with a label at the p/test
+column positions of that separator row.
 """
 from __future__ import annotations
 
 import textwrap
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Column Layout
+# Column Layout  (unchanged public API)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -57,9 +55,11 @@ def build_col_layout(
     idx = 1
     cols_per_group = 2 if split_count_pct else 1
 
+    cols_per_total = 2 if split_count_pct else 1
+
     if display_overall and overall_position == "first":
         layout.total_idx = idx
-        idx += 1
+        idx += cols_per_total
 
     if groups:
         layout.group_idxs = list(range(idx, idx + len(groups) * cols_per_group, cols_per_group))
@@ -67,7 +67,7 @@ def build_col_layout(
 
     if display_overall and overall_position == "last":
         layout.total_idx = idx
-        idx += 1
+        idx += cols_per_total
 
     if group_cols and display_p_values:
         layout.p_idx = idx
@@ -85,93 +85,99 @@ def build_col_layout(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# P-value separator injection
+# Canvas primitives
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _inject_pvalue_into_separator(
-    sep_line: str,
-    col_layout: ColLayout,
-    p_str: str,
-    test_str: str,
-) -> str:
+@dataclass
+class GCell:
+    """Data cell.  colspan > 1 spans multiple columns."""
+    content: str = ""
+    colspan: int = 1
+    align:   str = "c"    # "l" | "c"
+
+
+@dataclass
+class SCell:
+    """Separator cell.  fill fills the width; optional label shown centred."""
+    fill:    str = "-"
+    label:   str = ""
+    colspan: int = 1
+
+
+AnyCell = Union[GCell, SCell]
+_Row    = Tuple[str, List[AnyCell]]   # ("data"|"sep", cells)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Width computation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_widths(rows: List[_Row], n_cols: int) -> List[int]:
     """
-    Replace the dash segments at p_idx (and test_idx) of a separator line
-    with the p-value and test name, centered in the available width.
+    Derive minimum column widths from all rows.
 
-    Input:  '+-------+-------+-------+-------+'
-    Output: '+-------+-------+ 0.001 + Chi2  +'
+    Pass 1 – single-column cells set their column's floor.
+    Pass 2 – spanning cells expand the last spanned column if needed.
     """
-    # Split on '+' — result[0] and result[-1] are empty strings from the edges
-    parts = sep_line.split("+")[1:-1]   # inner segments (dashes)
+    widths = [3] * n_cols   # minimum: 1 content char + 2 padding
 
-    def _replace(parts, idx, text):
-        if idx is None or idx >= len(parts):
-            return
-        w = len(parts[idx])
-        inner = w - 2
-        if str(text).strip() == "":
-            # blank: replace dashes with spaces (open cell)
-            parts[idx] = " " * w
-        else:
-            display = str(text).strip()
-            parts[idx] = f" {display.center(inner)} "
+    # Pass 1: single-column cells
+    for _rtype, row in rows:
+        col = 0
+        for cell in row:
+            if cell.colspan == 1:
+                text = cell.content if isinstance(cell, GCell) else cell.label
+                if text:
+                    widths[col] = max(widths[col], len(str(text)) + 2)
+            col += cell.colspan
 
-    _replace(parts, col_layout.p_idx,    p_str)
-    _replace(parts, col_layout.test_idx, test_str)
+    # Pass 2: spanning cells
+    for _rtype, row in rows:
+        col = 0
+        for cell in row:
+            if cell.colspan > 1:
+                text = cell.content if isinstance(cell, GCell) else cell.label
+                if text:
+                    needed = len(str(text)) + 2
+                    avail  = sum(widths[col:col + cell.colspan]) + (cell.colspan - 1)
+                    if needed > avail:
+                        widths[col + cell.colspan - 1] += needed - avail
+            col += cell.colspan
 
-    return "+" + "+".join(parts) + "+"
+    return widths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-level text helpers
+# Row rendering
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_col_widths(sep_line: str) -> List[int]:
-    inner = sep_line.strip().strip("+")
-    return [len(p) for p in inner.split("+")]
-
-
-def _make_separator(widths: List[int], char: str = "-") -> str:
-    return "+" + "+".join(char * w for w in widths) + "+"
-
-
-def _make_custom_separator(widths: List[int], chars: List[str]) -> str:
-    parts = [chars[i] * w for i, w in enumerate(widths)]
-    return "+" + "+".join(parts) + "+"
-
-
-def _make_label_separator(cells: List[str], widths: List[int], fill_char="=") -> str:
-    parts = []
-    for cell, w in zip(cells, widths):
-        s = str(cell).strip() if cell else ""
-        if s:
-            cw = w - 2
-            parts.append(f" {s.center(cw)} ")
-        else:
-            parts.append(fill_char * w)
-    return "+" + "+".join(parts) + "+"
-
-
-def _make_row(cells: List[str], widths: List[int], first_align: str = "l") -> str:
-    parts = []
-    for i, (cell, w) in enumerate(zip(cells, widths)):
+def _render_data_row(row: List[GCell], widths: List[int]) -> str:
+    parts: List[str] = []
+    col = 0
+    for cell in row:
+        w  = (widths[col] if cell.colspan == 1
+              else sum(widths[col:col + cell.colspan]) + (cell.colspan - 1))
         cw = w - 2
-        s  = str(cell) if cell is not None else ""
-        if i == 0 and first_align == "l":
-            parts.append(f" {s[:cw].ljust(cw)} ")
+        s  = str(cell.content) if cell.content is not None else ""
+        parts.append(f" {s.ljust(cw)[:cw]} " if cell.align == "l"
+                     else f" {s.center(cw)[:cw]} ")
+        col += cell.colspan
+    return "|" + "|".join(parts) + "|"
+
+
+def _render_sep_row(row: List[SCell], widths: List[int]) -> str:
+    parts: List[str] = []
+    col = 0
+    for cell in row:
+        w = (widths[col] if cell.colspan == 1
+             else sum(widths[col:col + cell.colspan]) + (cell.colspan - 1))
+        if cell.label:
+            cw = w - 2
+            parts.append(f" {str(cell.label).center(cw)} ")
         else:
-            parts.append(f" {s[:cw].center(cw)} ")
-    return "|" + "|".join(parts) + "|"
-
-
-def _make_spanning_row(spans: List[Tuple[int, int, str]], widths: List[int]) -> str:
-    parts = []
-    for start, count, content in spans:
-        seg_w = sum(widths[start:start + count]) + (count - 1)
-        cw    = seg_w - 2
-        s     = str(content) if content else ""
-        parts.append(f" {s[:cw].center(cw)} ")
-    return "|" + "|".join(parts) + "|"
+            parts.append(cell.fill * w)
+        col += cell.colspan
+    return "+" + "+".join(parts) + "+"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,164 +203,218 @@ def _render_footnote(footnote: str, table_width: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Nested header builders
+# Header builders — return List[_Row]
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _label_cells(col_layout: ColLayout, n_cols: int) -> List[str]:
-    """Return a cell list where known roles have their label, rest empty."""
-    cells = [""] * n_cols
-    cells[col_layout.char_idx] = "Characteristic"
-    if col_layout.total_idx   is not None: cells[col_layout.total_idx]  = "Total"
-    if col_layout.p_idx       is not None: cells[col_layout.p_idx]      = "p-val"
-    if col_layout.test_idx    is not None: cells[col_layout.test_idx]   = "Test"
-    if col_layout.smd_idx     is not None: cells[col_layout.smd_idx]    = "SMD"
+def _label_sep_row(lay: ColLayout, n_total: int,
+                   fill: str = "=", total_show_n: bool = False) -> List[SCell]:
+    """Standard label-separator: Characteristic / Total / p-val / etc."""
+    cells: List[SCell] = []
+    col = 0
+    while col < lay.n_cols:
+        if col == lay.char_idx:
+            cells.append(SCell(fill, "Characteristic")); col += 1
+        elif lay.total_idx is not None and col == lay.total_idx:
+            lbl = f"Total (n={n_total})" if total_show_n else "Total"
+            span = 2 if lay.split_count_pct else 1
+            cells.append(SCell(fill, lbl, span)); col += span
+        elif lay.p_idx is not None and col == lay.p_idx:
+            cells.append(SCell(fill, "p-val")); col += 1
+        elif lay.test_idx is not None and col == lay.test_idx:
+            cells.append(SCell(fill, "Test")); col += 1
+        elif lay.smd_idx is not None and col == lay.smd_idx:
+            cells.append(SCell(fill, "SMD")); col += 1
+        else:
+            cells.append(SCell(fill)); col += 1
     return cells
 
 
-def _pre_post_spans(col_layout, groups):
-    """Helper: build span tuples for columns before and after the group block."""
-    pre  = sorted(i for i in [col_layout.char_idx,
-                               col_layout.total_idx if col_layout.total_idx is not None
-                               and col_layout.total_idx < col_layout.group_idxs[0]
-                               else None]
-                  if i is not None)
-    post = sorted(i for i in [
-        col_layout.total_idx if col_layout.total_idx is not None
-        and col_layout.total_idx > col_layout.group_idxs[-1] else None,
-        col_layout.p_idx, col_layout.test_idx, col_layout.smd_idx,
-    ] if i is not None)
-    return pre, post
+def _build_header_rows(
+    lay:          ColLayout,
+    group_cols:   List[str],
+    groups:       List[Any],
+    group_counts: Dict[Any, int],
+    n_total:      int,
+) -> List[_Row]:
+    """
+    Build all header rows as (rtype, cells) pairs.
+    Does NOT include the final === data-start separator.
+    """
+    n_levels = len(group_cols)
+    if n_levels == 0 or not groups:
+        # No grouping: single label-sep row with n= in Total column
+        return [("sep", _label_sep_row(lay, n_total, "=", total_show_n=True))]
+    if n_levels == 1:
+        return _header_single_level(lay, group_cols, groups, group_counts, n_total)
+    return _header_multi_level(lay, group_cols, groups, group_counts, n_total)
 
 
-def _header_single_level(col_layout, group_cols, groups, group_counts, n_total, widths):
-    gc_name      = group_cols[0]
-    n_grp_total  = sum(group_counts.get(g, 0) for g in groups)
-    pre, post    = _pre_post_spans(col_layout, groups)
-    cols_per_grp = 2 if col_layout.split_count_pct else 1
+def _header_single_level(
+    lay: ColLayout,
+    group_cols: List[str],
+    groups: List[Any],
+    group_counts: Dict[Any, int],
+    n_total: int,
+) -> List[_Row]:
+    n           = lay.n_cols
+    gc_name     = group_cols[0]
+    n_grp_total = sum(group_counts.get(g, 0) for g in groups)
+    cpt         = 2 if lay.split_count_pct else 1   # cols per group
+    gi0         = lay.group_idxs[0]
+    total_span  = cpt * len(groups)
 
-    # Row 1 — spanning
-    spans = ([(i, 1, "") for i in pre]
-             + [(col_layout.group_idxs[0], cols_per_grp * len(groups),
-                 f"{gc_name}  (n={n_grp_total})")]
-             + [(i, 1, "") for i in post])
-    row1  = _make_spanning_row(spans, widths)
+    # Row 1: spanning group-variable name
+    cells1: List[GCell] = []
+    col = 0
+    while col < n:
+        if col == gi0:
+            cells1.append(GCell(f"{gc_name}  (n={n_grp_total})", total_span))
+            col += total_span
+        else:
+            cells1.append(GCell("", 1))
+            col += 1
 
-    # Row 2 — label separator
-    row2 = _make_label_separator(_label_cells(col_layout, col_layout.n_cols),
-                                 widths, fill_char="=")
+    # Row 2: label separator
+    cells2 = _label_sep_row(lay, n_total, "=", total_show_n=False)
 
-    if col_layout.split_count_pct:
-        # Row 3 — group values spanning n+% sub-columns each
-        # Use just the group name (n= shown in data; col may be too narrow for full label)
-        spans3 = [(i, 1, "") for i in pre]
-        for j, g in enumerate(groups):
-            gi = col_layout.group_idxs[j]
-            spans3.append((gi, 2, str(g)))
-        for i in post:
-            content = f"(n={n_total})" if i == col_layout.total_idx else ""
-            spans3.append((i, 1, content))
-        row3 = _make_spanning_row(spans3, widths)
+    rows: List[_Row] = [("data", cells1), ("sep", cells2)]
 
-        # Row 4 — n / % sub-column labels
-        cells4 = [""] * col_layout.n_cols
-        for j in range(len(groups)):
-            gi = col_layout.group_idxs[j]
-            cells4[gi]     = "n"
-            cells4[gi + 1] = "%"
-        row4 = _make_row(cells4, widths)
-        return [row1, row2, row3, row4]
+    if lay.split_count_pct:
+        # Row 3: group names spanning n+% each; Total spans 2 if split
+        cells3: List[GCell] = []
+        col = 0
+        while col < n:
+            if col in lay.group_idxs:
+                j = lay.group_idxs.index(col)
+                cells3.append(GCell(f"{groups[j]}  (n={group_counts.get(groups[j], '?')})", 2))
+                col += 2
+            elif lay.total_idx is not None and col == lay.total_idx:
+                cells3.append(GCell(f"(n={n_total})", 2))
+                col += 2
+            else:
+                cells3.append(GCell(""))
+                col += 1
+        rows.append(("data", cells3))
+
+        # Row 4: n / % sub-column labels (groups + Total)
+        cells4: List[GCell] = [GCell("") for _ in range(n)]
+        for gi in lay.group_idxs:
+            cells4[gi]     = GCell("n")
+            cells4[gi + 1] = GCell("%")
+        if lay.total_idx is not None:
+            cells4[lay.total_idx]     = GCell("n")
+            cells4[lay.total_idx + 1] = GCell("%")
+        rows.append(("data", cells4))
     else:
-        # Row 3 — group values with n
-        cells3 = [""] * col_layout.n_cols
+        # Row 3: group leaf values with per-group n
+        cells3_plain: List[GCell] = [GCell("") for _ in range(n)]
         for j, g in enumerate(groups):
-            cells3[col_layout.group_idxs[j]] = f"{g}  (n={group_counts.get(g, '?')})"
-        if col_layout.total_idx is not None:
-            cells3[col_layout.total_idx] = f"(n={n_total})"
-        row3 = _make_row(cells3, widths)
-        return [row1, row2, row3]
+            cells3_plain[lay.group_idxs[j]] = GCell(
+                f"{g}  (n={group_counts.get(g, '?')})"
+            )
+        if lay.total_idx is not None:
+            cells3_plain[lay.total_idx] = GCell(f"(n={n_total})")
+        rows.append(("data", cells3_plain))
+
+    return rows
 
 
-def _header_multi_level(col_layout, group_cols, groups, group_counts, n_total, widths):
-    pre, post    = _pre_post_spans(col_layout, groups)
-    n_levels     = len(group_cols)
-    cols_per_grp = 2 if col_layout.split_count_pct else 1
+def _header_multi_level(
+    lay: ColLayout,
+    group_cols: List[str],
+    groups: List[Any],
+    group_counts: Dict[Any, int],
+    n_total: int,
+) -> List[_Row]:
+    n        = lay.n_cols
+    n_levels = len(group_cols)
+    cpt      = 2 if lay.split_count_pct else 1
 
-    header_rows: List[str] = []
-
-    # Build level separator: mark both sub-columns for each group when split
-    if col_layout.split_count_pct:
-        group_col_set = set()
-        for gi in col_layout.group_idxs:
-            group_col_set.add(gi)
+    # Column indices that belong to the group block
+    group_col_set: set = set()
+    for gi in lay.group_idxs:
+        group_col_set.add(gi)
+        if lay.split_count_pct:
             group_col_set.add(gi + 1)
-        sep_chars = ["-" if i in group_col_set else " " for i in range(len(widths))]
-    else:
-        sep_chars = ["-" if i in col_layout.group_idxs else " " for i in range(len(widths))]
-    level_separator = _make_custom_separator(widths, sep_chars)
+
+    rows: List[_Row] = []
 
     for lvl in range(n_levels - 1):
+        # Collect unique prefixes at this level
         prefixes: OrderedDict = OrderedDict()
         for j, g in enumerate(groups):
             prefix = g[:lvl + 1] if isinstance(g, tuple) else (g,)
             prefixes.setdefault(prefix, []).append(j)
 
-        spans = [(i, 1, "") for i in pre]
-        for prefix, idxs in prefixes.items():
-            count = sum(group_counts.get(groups[j], 0) for j in idxs)
-            label = f"{prefix[-1]}  (n={count})"
-            spans.append((col_layout.group_idxs[idxs[0]], cols_per_grp * len(idxs), label))
-        spans.extend([(i, 1, "") for i in post])
+        # Spanning data row for this level
+        cells_data: List[GCell] = []
+        col = 0
+        while col < n:
+            matched = False
+            for prefix, idxs in prefixes.items():
+                start_col = lay.group_idxs[idxs[0]]
+                span_w    = cpt * len(idxs)
+                if col == start_col:
+                    count = sum(group_counts.get(groups[j], 0) for j in idxs)
+                    cells_data.append(GCell(f"{prefix[-1]}  (n={count})", span_w))
+                    col += span_w
+                    matched = True
+                    break
+            if not matched:
+                cells_data.append(GCell(""))
+                col += 1
+        rows.append(("data", cells_data))
 
-        header_rows.append(_make_spanning_row(spans, widths))
-
+        # Separator after this spanning row
         if n_levels == 2 or lvl == n_levels - 3:
-            header_rows.append(_make_label_separator(
-                _label_cells(col_layout, col_layout.n_cols), widths, fill_char="-"
-            ))
+            rows.append(("sep", _label_sep_row(lay, n_total, "-", total_show_n=False)))
         else:
-            header_rows.append(level_separator)
+            sep_cells: List[SCell] = [
+                SCell("-") if i in group_col_set else SCell(" ")
+                for i in range(n)
+            ]
+            rows.append(("sep", sep_cells))
 
-    if col_layout.split_count_pct:
-        # Last header row: each group value spans 2 sub-columns
-        spans_final = [(i, 1, "") for i in pre]
-        for j, g in enumerate(groups):
-            gi = col_layout.group_idxs[j]
-            spans_final.append((gi, 2, str(g[-1])))
-        for i in post:
-            content = f"(n={n_total})" if i == col_layout.total_idx else ""
-            spans_final.append((i, 1, content))
-        header_rows.append(_make_spanning_row(spans_final, widths))
+    if lay.split_count_pct:
+        # Last header row: leaf group values spanning 2 each; Total spans 2
+        cells_last: List[GCell] = []
+        col = 0
+        while col < n:
+            if col in lay.group_idxs:
+                j = lay.group_idxs.index(col)
+                g = groups[j]
+                leaf = g[-1] if isinstance(g, tuple) else g
+                cells_last.append(GCell(f"{leaf}  (n={group_counts.get(g, '?')})", 2))
+                col += 2
+            elif lay.total_idx is not None and col == lay.total_idx:
+                cells_last.append(GCell(f"(n={n_total})", 2))
+                col += 2
+            else:
+                cells_last.append(GCell(""))
+                col += 1
+        rows.append(("data", cells_last))
 
-        # n / % sub-column labels row
-        cells_np = [""] * col_layout.n_cols
-        for gi in col_layout.group_idxs:
-            cells_np[gi]     = "n"
-            cells_np[gi + 1] = "%"
-        header_rows.append(_make_row(cells_np, widths))
+        cells_np: List[GCell] = [GCell("") for _ in range(n)]
+        for gi in lay.group_idxs:
+            cells_np[gi]     = GCell("n")
+            cells_np[gi + 1] = GCell("%")
+        if lay.total_idx is not None:
+            cells_np[lay.total_idx]     = GCell("n")
+            cells_np[lay.total_idx + 1] = GCell("%")
+        rows.append(("data", cells_np))
     else:
-        cells_values = [""] * col_layout.n_cols
+        # Last header row: leaf group values with n
+        cells_leaf: List[GCell] = [GCell("") for _ in range(n)]
         for j, g in enumerate(groups):
-            cells_values[col_layout.group_idxs[j]] = f"{g[-1]}  (n={group_counts.get(g, '?')})"
-        if col_layout.total_idx is not None:
-            cells_values[col_layout.total_idx] = f"(n={n_total})"
-        header_rows.append(_make_row(cells_values, widths))
+            leaf = g[-1] if isinstance(g, tuple) else g
+            cells_leaf[lay.group_idxs[j]] = GCell(
+                f"{leaf}  (n={group_counts.get(g, '?')})"
+            )
+        if lay.total_idx is not None:
+            cells_leaf[lay.total_idx] = GCell(f"(n={n_total})")
+        rows.append(("data", cells_leaf))
 
-    return header_rows
-
-
-def _build_header_lines(col_layout, group_cols, groups, group_counts, n_total, widths):
-    n_levels = len(group_cols)
-    if n_levels == 0 or not groups:
-        # No grouping: still render a plain header row for consistency
-        cells = _label_cells(col_layout, col_layout.n_cols)
-        if col_layout.total_idx is not None:
-            cells[col_layout.total_idx] = f"Total (n={n_total})"
-        return [_make_label_separator(cells, widths, fill_char="=")]
-    if n_levels == 1:
-        return _header_single_level(col_layout, group_cols, groups, group_counts,
-                                    n_total, widths)
-    return _header_multi_level(col_layout, group_cols, groups, group_counts,
-                               n_total, widths)
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,92 +428,100 @@ def render_text_table(
     groups:            List[Any],
     group_counts:      Dict[Any, int],
     n_total:           int,
-    tablefmt:          str                          = "grid",
-    title:             Optional[str]                = None,
-    footnote:          Optional[str]                = None,
-    pvalue_injections: Optional[List[Tuple[int, str, str]]] = None,
+    tablefmt:          str                                   = "grid",
+    title:             Optional[str]                         = None,
+    footnote:          Optional[str]                         = None,
+    pvalue_injections: Optional[List[Tuple[int, str, str, bool]]] = None,
 ) -> str:
     """
     Render a complete text table.
 
-    Parameters
-    ----------
-    flat_df            : DataFrame with flat (non-MultiIndex) columns.
-    col_layout         : ColLayout describing which column index holds each role.
-    group_cols         : list of grouping column names (for header building).
-    groups             : ordered list of group keys.
-    group_counts       : {group_key: n_observations}.
-    n_total            : total rows in the source DataFrame.
-    tablefmt           : tabulate format string.
-    title              : optional title box above.
-    footnote           : optional footnote box below.
-    pvalue_injections  : list of (row_k, p_str, test_str).
-                         The separator AFTER flat_df row row_k gets the
-                         p-value/test injected into its p/test column segments.
+    For 'grid' format uses the canvas/grid renderer (column widths derived
+    from all content).  Other formats fall back to tabulate directly.
     """
-    from tabulate import tabulate as _tabulate
+    if tablefmt != "grid":
+        from tabulate import tabulate as _tabulate
+        body = _tabulate(flat_df, headers="keys", tablefmt=tablefmt, showindex=False)
+        parts = []
+        if title:    parts.append(title)
+        parts.append(body)
+        if footnote: parts.append(footnote)
+        return "\n".join(parts)
 
-    # ── Step 1: raw tabulate (blank header row) ───────────────────────────
-    raw   = _tabulate(flat_df,
-                      headers=[""] * len(flat_df.columns),
-                      tablefmt=tablefmt,
-                      showindex=False)
-    lines = raw.split("\n")
+    lay    = col_layout
+    n_cols = lay.n_cols
 
-    # Find the === separator (marks end of header, start of data)
-    header_sep_idx = next(
-        (i for i, ln in enumerate(lines) if i > 0 and ln.startswith("+") and "=" in ln),
-        None,
-    )
-    if header_sep_idx is None:
-        # Fallback for formats without === (simple, pipe, etc.)
-        out_parts = []
-        if title:    out_parts.append(f"\n{title}\n{'─'*max(len(title),40)}")
-        out_parts.append(raw)
-        if footnote: out_parts.append(f"{'─'*max(len(footnote),40)}\n{footnote}")
-        return "\n".join(out_parts)
-
-    # ── Step 2: parse column widths ───────────────────────────────────────
-    widths = _parse_col_widths(lines[0])
-
-    # ── Step 3: inject p-values into separator lines ─────────────────────
-    # Separator after data row k is at line index: header_sep_idx + 2 + k*2
-    if pvalue_injections and col_layout.p_idx is not None:
+    # ── Build p-value lookup ──────────────────────────────────────────────
+    # pval_map[k]  → (p_str, test_str)  inject into sep AFTER data row k
+    # blank_set[k] → open (space) the p/test columns in sep after row k
+    pval_map:  Dict[int, Tuple[str, str]] = {}
+    blank_set: set                         = set()
+    if pvalue_injections:
         for k, p_str, test_str, is_middle in pvalue_injections:
-            sep_line_idx = header_sep_idx + 2 + k * 2
-            if 0 <= sep_line_idx < len(lines):
-                if is_middle:
-                    # Reemplaza p-col y test-col con valor real
-                    lines[sep_line_idx] = _inject_pvalue_into_separator(
-                        lines[sep_line_idx], col_layout, p_str, test_str
-                    )
-                else:
-                    lines[sep_line_idx] = _inject_pvalue_into_separator(
-                        lines[sep_line_idx], col_layout, " ", " "
-                    )
+            if is_middle:
+                pval_map[k] = (p_str, test_str)
+            else:
+                blank_set.add(k)
 
-    # ── Step 4: build nested header rows ─────────────────────────────────
-    header_lines = _build_header_lines(
-        col_layout, group_cols, groups, group_counts, n_total, widths
-    )
+    # ── Collect all rows for width computation ────────────────────────────
+    header_rows = _build_header_rows(lay, group_cols, groups, group_counts, n_total)
 
-    # ── Step 5: assemble ─────────────────────────────────────────────────
-    table_width   = len(lines[0])
-    top_border    = lines[0]
-    header_sep    = lines[header_sep_idx]
-    data_lines    = lines[header_sep_idx + 1:]
+    all_rows: List[_Row] = list(header_rows)
+    for row_vals in flat_df.values:
+        data_cells: List[GCell] = [
+            GCell(str(v) if v is not None else "", 1, "l" if i == 0 else "c")
+            for i, v in enumerate(row_vals)
+        ]
+        all_rows.append(("data", data_cells))
+
+    widths = _compute_widths(all_rows, n_cols)
+
+    # ── Render ────────────────────────────────────────────────────────────
+    lines: List[str] = []
+
+    # Top border
+    lines.append(_render_sep_row([SCell("-") for _ in range(n_cols)], widths))
+
+    # Header rows (consecutive data rows get a "-" separator between them)
+    prev_was_data = False
+    for rtype, cells in header_rows:
+        if rtype == "data" and prev_was_data:
+            lines.append(_render_sep_row([SCell("-") for _ in range(n_cols)], widths))
+        if rtype == "data":
+            lines.append(_render_data_row(cells, widths))   # type: ignore[arg-type]
+        else:
+            lines.append(_render_sep_row(cells, widths))    # type: ignore[arg-type]
+        prev_was_data = (rtype == "data")
+
+    # === separator (header / data boundary)
+    lines.append(_render_sep_row([SCell("=") for _ in range(n_cols)], widths))
+
+    # Data rows
+    for k, row_vals in enumerate(flat_df.values):
+        data_cells = [
+            GCell(str(v) if v is not None else "", 1, "l" if i == 0 else "c")
+            for i, v in enumerate(row_vals)
+        ]
+        lines.append(_render_data_row(data_cells, widths))
+
+        # Separator after this row (with optional p-value injection)
+        sep_cells: List[SCell] = [SCell("-") for _ in range(n_cols)]
+        if k in pval_map:
+            p_str, test_str = pval_map[k]
+            if lay.p_idx    is not None: sep_cells[lay.p_idx]    = SCell("-", p_str)
+            if lay.test_idx is not None: sep_cells[lay.test_idx] = SCell("-", test_str)
+        elif k in blank_set:
+            if lay.p_idx    is not None: sep_cells[lay.p_idx]    = SCell(" ")
+            if lay.test_idx is not None: sep_cells[lay.test_idx] = SCell(" ")
+        lines.append(_render_sep_row(sep_cells, widths))
+
+    table_str   = "\n".join(lines)
+    table_width = len(lines[0])
 
     out_parts: List[str] = []
-
     if title:
         out_parts.append(_render_title(title, table_width))
-
-    out_parts.append(top_border)
-    if header_lines:
-        out_parts.extend(header_lines)
-    out_parts.append(header_sep)
-    out_parts.extend(data_lines)
-
+    out_parts.append(table_str)
     if footnote:
         out_parts.append(_render_footnote(footnote, table_width))
 

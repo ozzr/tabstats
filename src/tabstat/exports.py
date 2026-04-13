@@ -343,13 +343,15 @@ def to_excel_file(
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
     """Flatten MultiIndex columns to single-level strings."""
+    import math
     out = df.copy()
     if isinstance(out.columns, pd.MultiIndex):
+        def _keep(c):
+            if isinstance(c, float) and math.isnan(c):
+                return False
+            return bool(c) and str(c).strip() not in ("", " ")
         out.columns = [
-            "\n".join(
-                str(c) for c in col
-                if c and str(c).strip() not in ("", " ")
-            )
+            "\n".join(str(c) for c in col if _keep(c))
             for col in out.columns.values
         ]
     return out
