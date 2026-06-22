@@ -1,0 +1,54 @@
+name: Sync wiki
+
+# Publishes docs/*.md to the GitHub Wiki (a separate git repo:
+# https://github.com/<owner>/<repo>.wiki.git) on every push to main that
+# touches docs/.
+#
+# One-time setup required (cannot be done from a workflow):
+#   1. Repo Settings → General → Features → enable "Wikis".
+#   2. Create a Personal Access Token (classic, scope: repo) and add it as
+#      a repository secret named WIKI_TOKEN (Settings → Secrets and
+#      variables → Actions). The default GITHUB_TOKEN does not have access
+#      to the wiki's separate git namespace.
+#   3. Open the wiki once in the GitHub UI and save any page (even blank) —
+#      GitHub only creates the wiki.git repo after the first manual edit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
+
+jobs:
+  sync-wiki:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+
+      - name: Clone wiki repo
+        env:
+          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki
+
+      - name: Copy docs into wiki page names
+        run: |
+          cp docs/Home.md          wiki/Home.md
+          cp docs/api_reference.md wiki/API-reference.md
+          cp docs/configuration.md wiki/Configuration.md
+          cp docs/examples.md      wiki/Examples.md
+
+      - name: Commit and push if changed
+        run: |
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki already up to date."
+          else
+            git commit -m "docs: sync wiki from docs/ @ ${GITHUB_SHA::7}"
+            git push
+          fi

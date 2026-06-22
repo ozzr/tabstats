@@ -1,0 +1,1520 @@
+"""
+tabstat/generator.py
+────────────────────
+Core Table 1 generator.  Analysis runs ONCE in _run_analysis(); all output
+formats (df, grid, html, …) branch from that single result.
+
+Row metadata
+────────────
+Every row produced by _summarize_* comes paired with a RowMeta dict:
+  kind        : 'var_header' | 'stat' | 'category' | 'missing'
+  var         : variable name
+  pvalue_span : (p_str, test_str, cat_offset, n_cats) | None
+                cat_offset is *relative* (rows from this header to first cat).
+                _run_analysis() converts it to an absolute index used by
+                _get_pvalue_injections() → rendering.py.
+
+P-value display for categoricals
+─────────────────────────────────
+For categorical variables with ≥2 categories, the p-value is NOT placed
+inside a data cell.  Instead it is injected into the separator line between
+the middle two category rows by render_text_table() in rendering.py.
+This produces the SPSS-style spanning appearance.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from scipy.stats import (
+    binom,
+    chi2_contingency,
+    f_oneway,
+    fisher_exact,
+    kruskal,
+    levene,
+    mannwhitneyu,
+    ttest_ind,
+    ttest_rel,
+    wilcoxon,
+)
+from tabulate import tabulate
+
+from .config import TabStatConfig, TestOverrideConfig
+from .normality import NormalitySelector
+from .resolver import TestResolver
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# McNemar (no statsmodels dependency)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mcnemar_exact(ct: pd.DataFrame) -> float:
+    b, c = int(ct.iloc[0, 1]), int(ct.iloc[1, 0])
+    n = b + c
+    if n == 0:
+        return np.nan
+    return float(min(2 * binom.cdf(min(b, c), n, 0.5), 1.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TabStatGenerator:
+    """
+    Generates publication-ready Table 1 for descriptive clinical studies.
+
+    Usage
+    -----
+    >>> gen = TabStatGenerator()
+    >>> df_out = gen.generate(df, "age + sex + creat | outcome",
+    ...                       output_format="grid", title="Table 1")
+    """
+
+    def __init__(self, config: Optional[TabStatConfig] = None) -> None:
+        self.config = config or TabStatConfig()
+        self.normality_selector = NormalitySelector()
+        self.test_resolver = TestResolver(self.config.test_overrides)
+
+    # =========================================================================
+    # Public API
+    # =========================================================================
+
+    def generate(
+        self,
+        df: pd.DataFrame,
+        formula: str,
+        output_format: str = "df",   # 'df'|'grid'|'markdown'|'latex'|'html'
+        column_labels: Optional[Dict[str, str]] = None,
+        paired: bool = False,
+        title: Optional[str] = None,
+        footnote: Optional[str] = None,
+        show: bool = True,
+    ) -> Union[pd.DataFrame, str]:
+        """
+        Run analysis once and return result in the requested format.
+
+        Parameters
+        ----------
+        df            : source DataFrame
+        formula       : "var1+var2 | group"  /  "~ . | group"  /  "~ ."
+        output_format : 'df' | 'grid' | 'markdown' | 'latex' | 'html'
+        column_labels : rename variables or group values
+        paired        : use paired tests
+        title         : optional title (box above for text; first-column row for df)
+        footnote      : optional footnote (box below for text; first-column row for df)
+        show          : if True (default), print text formats to stdout
+
+        Returns
+        -------
+        pd.DataFrame  for 'df' (title/footnote prepended/appended as rows if given)
+        str           for 'html'
+        pd.DataFrame  for text formats (printed if show=True; df also returned)
+        """
+        from .rendering import build_col_layout, render_text_table
+
+        # ── Single analysis run ───────────────────────────────────────────
+        (result_df, row_metas, col_layout,
+         group_cols, groups, group_counts) = self._run_analysis(
+            df, formula, column_labels, paired
+        )
+
+        # ── SMD with >2 groups: warn, column is meaningless ─────────────────
+        if self.config.display_smd and len(groups) > 2:
+            import warnings as _warnings
+            _warnings.warn(
+                "display_smd=True with >2 groups: SMD is defined for 2-group comparisons "
+                "only. The SMD column will be empty for all rows.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # ── Multiple testing correction footnote ─────────────────────────
+        if self.config.correction != "none":
+            corr_note = {
+                "bonferroni": "P-values adjusted using Bonferroni correction.",
+                "fdr_bh":     "P-values adjusted using Benjamini-Hochberg FDR.",
+            }.get(self.config.correction, "")
+            if corr_note:
+                footnote = (
+                    "\n".join(filter(None, [footnote, corr_note]))
+                    if footnote else corr_note
+                )
+
+        # ── Normality method footnote ────────────────────────────────────
+        if self.config.show_normality_method:
+            norm_parts: List[str] = []
+            for meta in row_metas:
+                ni = meta.get("normality_info")
+                if ni:
+                    v_name, descs = ni
+                    norm_parts.append(f"{v_name}: {'; '.join(descs)}")
+            if norm_parts:
+                norm_note = "Normality tests — " + " | ".join(norm_parts)
+                footnote  = (
+                    "\n".join(filter(None, [footnote, norm_note]))
+                    if footnote else norm_note
+                )
+
+        # ── Optional data quality checks ─────────────────────────────────
+        if self.config.check_outliers or self.config.check_multimodal:
+            variables_for_checks, _ = self._parse_formula(df, formula)
+            quality_footnotes = self._run_data_quality_checks(df, variables_for_checks)
+            if quality_footnotes:
+                footnote = "\n".join(filter(None, [footnote] + quality_footnotes)) if footnote else "\n".join(quality_footnotes)
+
+        # ── DataFrame output ──────────────────────────────────────────────
+        if output_format == "df":
+            decorated = self._decorate_df_output(result_df, row_metas, col_layout)
+            return self._attach_title_footnote(decorated, title, footnote)
+
+        # ── HTML output ───────────────────────────────────────────────────
+        if output_format == "html":
+            from .exports import to_html_str
+            return to_html_str(result_df,
+                               title=title or "Table 1",
+                               footnote=footnote)
+
+        # ── Text output (grid / markdown / latex / …) ─────────────────────
+        flat_df = self._flatten_multiindex_columns(result_df)
+        pvalue_injections = self._get_pvalue_injections(row_metas)
+
+        # For non-grid formats: inject categorical p-values into var_header
+        # rows and use clean single-line column headers.
+        if output_format != "grid":
+            flat_df = self._prepare_flat_for_tabulate(flat_df, row_metas, col_layout)
+
+        # Remap group names/values for the renderer when column_labels given
+        if column_labels:
+            def _cl(val):
+                """Look up a label: try raw value key, then str(value)."""
+                return column_labels.get(val, column_labels.get(str(val), str(val)))
+
+            render_groups = [
+                tuple(_cl(v) for v in g) if isinstance(g, tuple) else _cl(g)
+                for g in groups
+            ]
+            render_counts = {rg: group_counts[og]
+                             for rg, og in zip(render_groups, groups)}
+            render_group_cols = [
+                column_labels.get(gc, column_labels.get(str(gc), gc))
+                for gc in group_cols
+            ]
+        else:
+            render_groups     = groups
+            render_counts     = group_counts
+            render_group_cols = group_cols
+
+        text = render_text_table(
+            flat_df           = flat_df,
+            col_layout        = col_layout,
+            group_cols        = render_group_cols,
+            groups            = render_groups,
+            group_counts      = render_counts,
+            n_total           = len(df),
+            tablefmt          = output_format,
+            title             = title,
+            footnote          = footnote,
+            pvalue_injections = pvalue_injections,
+        )
+
+        if show:
+            print(text)
+
+        decorated = self._decorate_df_output(result_df, row_metas, col_layout)
+        return self._attach_title_footnote(decorated, title, footnote)
+
+    # ── Export helpers ────────────────────────────────────────────────────
+
+    def to_html(self, df: pd.DataFrame, path: Optional[str] = None,
+                title: str = "Table 1",
+                footnote: Optional[str] = None) -> str:
+        from .exports import to_html_str
+        html = to_html_str(df, title=title, footnote=footnote)
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            logger.info("HTML written to %s", path)
+        return html
+
+    def to_excel(self, df: pd.DataFrame, path: str,
+                 title: Optional[str] = "Table 1",
+                 footnote: Optional[str] = None,
+                 publication_style: bool = False,
+                 **style_kwargs) -> None:
+        from .exports import to_excel_file
+        t = self._titles()
+        to_excel_file(df, path, title=title, footnote=footnote,
+                      characteristic_label=t["characteristic"], total_label=t["total"],
+                      p_value_label=t["p_value"], test_label=t["test"], smd_label=t["smd"],
+                      publication_style=publication_style, **style_kwargs)
+        logger.info("Excel written to %s", path)
+
+    def to_excel_workbook(
+        self,
+        tables: List[Tuple[str, pd.DataFrame]],
+        path: str,
+        publication_style: bool = False,
+        **style_kwargs,
+    ) -> None:
+        from .exports import to_excel_file
+        t = self._titles()
+        to_excel_file(tables, path,
+                      characteristic_label=t["characteristic"], total_label=t["total"],
+                      p_value_label=t["p_value"], test_label=t["test"], smd_label=t["smd"],
+                      publication_style=publication_style, **style_kwargs)
+        logger.info("Excel workbook written to %s", path)
+
+    def to_docx(self, df: pd.DataFrame, path: str,
+                title: Optional[str] = "Table 1",
+                footnote: Optional[str] = None) -> None:
+        from .exports import to_docx_file
+        to_docx_file(df, path, title=title, footnote=footnote)
+        logger.info("DOCX written to %s", path)
+
+    def to_latex(self, df: pd.DataFrame) -> str:
+        flat = self._flatten_for_tabulate(self._flatten_multiindex_columns(df))
+        return tabulate(flat, headers="keys", tablefmt="latex", showindex=False)
+
+    # =========================================================================
+    # Core analysis (runs exactly once)
+    # =========================================================================
+
+    def _run_analysis(
+        self,
+        df: pd.DataFrame,
+        formula: str,
+        column_labels: Optional[Dict[str, str]],
+        paired: bool,
+    ) -> Tuple:
+        """
+        Execute the full statistical pipeline.
+
+        Returns
+        -------
+        (result_df, row_metas, col_layout, group_cols, groups, group_counts)
+        """
+        from .rendering import build_col_layout
+
+        variables, group_cols = self._parse_formula(df, formula)
+        self._validate_dataframe(df, variables, group_cols)
+
+        groups       = self._get_groups(df, group_cols)
+        group_counts = self._compute_group_counts(df, group_cols, groups)
+
+        _var_labels, _val_maps = self._parse_column_labels(column_labels)
+
+        col_layout = build_col_layout(
+            group_cols        = group_cols,
+            groups            = groups,
+            display_overall   = self.config.display_overall,
+            overall_position  = self.config.overall_position,
+            display_p_values  = self.config.display_p_values,
+            display_test_name = self.config.display_test_name,
+            display_smd       = self.config.display_smd,
+            split_count_pct   = self.config.split_count_pct,
+        )
+
+        all_rows:    List[List[Any]] = []
+        all_metas:   List[Dict]      = []
+        failed_vars: List[str]       = []
+
+        # ── Section header pre-computation ────────────────────────────────
+        # Maps var_name → section_label for the first var of each section.
+        _section_first: Dict[str, str] = {}
+        if self.config.sections:
+            for sec_label, sec_vars in self.config.sections.items():
+                first_in_section = next(
+                    (v for v in sec_vars if v in variables), None
+                )
+                if first_in_section and first_in_section not in _section_first:
+                    _section_first[first_in_section] = sec_label
+
+        for var in variables:
+            # ── Section header (injected before first var of the section) ─
+            if var in _section_first:
+                sec_label   = _section_first[var]
+                n_data_cols = col_layout.n_cols
+                sec_row     = [f"\u2500\u2500\u2500 {sec_label} \u2500\u2500\u2500"] + [""] * (n_data_cols - 1)
+                all_rows.append(sec_row)
+                all_metas.append({"kind": "section", "var": None, "pvalue_span": None})
+
+            try:
+                vtype      = self._get_render_type(df, var)
+                _is_paired = paired or var in self.config.paired_vars
+                if vtype == "numeric":
+                    var_rows, var_metas = self._summarize_numeric(
+                        df, var, group_cols, groups, paired=_is_paired,
+                        var_label=_var_labels.get(var),
+                    )
+                else:
+                    var_rows, var_metas = self._summarize_categorical(
+                        df, var, group_cols, groups, paired=_is_paired,
+                        var_label=_var_labels.get(var),
+                        val_map=_val_maps.get(var),
+                    )
+
+                # Convert relative cat_offset → absolute cat_start_abs
+                base = len(all_rows)
+                for local_i, meta in enumerate(var_metas):
+                    span = meta.get("pvalue_span")
+                    if span is not None:
+                        p_str, test_str, cat_offset, n_cats = span
+                        meta["pvalue_span"] = (
+                            p_str, test_str,
+                            base + local_i + cat_offset,  # absolute
+                            n_cats,
+                        )
+
+                all_rows.extend(var_rows)
+                all_metas.extend(var_metas)
+
+            except Exception as exc:
+                logger.warning("Failed to summarize '%s': %s", var, exc)
+                failed_vars.append(var)
+
+        if failed_vars:
+            import warnings as _warnings
+            _warnings.warn(
+                f"tabstat: could not summarize variable(s): {', '.join(failed_vars)}. "
+                "Check log output for details.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # ── Multiple testing correction ───────────────────────────────────
+        if (self.config.correction != "none" and group_cols
+                and self.config.display_p_values and col_layout.p_idx is not None):
+            p_col_idx = col_layout.p_idx
+
+            # Collect (meta_idx, raw_p) for entries that have a raw p-value
+            raw_p_entries = [
+                (i, meta["raw_p"])
+                for i, meta in enumerate(all_metas)
+                if meta.get("raw_p") is not None and not np.isnan(meta["raw_p"])
+            ]
+            if raw_p_entries:
+                indices, raw_vals = zip(*raw_p_entries)
+                corrected_vals = self._apply_correction(list(raw_vals))
+                for idx_in_metas, corrected_p in zip(indices, corrected_vals):
+                    meta = all_metas[idx_in_metas]
+                    p_fmt = self._format_p(corrected_p)
+                    if meta.get("pvalue_span") is not None:
+                        # Update pvalue_span tuple
+                        old = meta["pvalue_span"]
+                        meta["pvalue_span"] = (p_fmt, old[1], old[2], old[3])
+                    else:
+                        # Update row cell directly
+                        row = all_rows[idx_in_metas]
+                        if p_col_idx < len(row):
+                            row[p_col_idx] = p_fmt
+
+        # Build DataFrame
+        columns   = self._build_columns(df, group_cols, groups, group_counts)
+        n_cols    = len(columns)
+        norm_rows = self._normalize_rows(all_rows, n_cols)
+        result_df = pd.DataFrame(norm_rows, columns=columns)
+
+        # Remap column labels — try raw key then str key
+        if column_labels:
+            def _cl_remap(val):
+                return column_labels.get(val, column_labels.get(str(val), val))
+            if isinstance(result_df.columns, pd.MultiIndex):
+                result_df.columns = pd.MultiIndex.from_tuples([
+                    tuple(_cl_remap(c) for c in col)
+                    for col in result_df.columns
+                ])
+            else:
+                result_df.rename(columns={
+                    c: _cl_remap(c) for c in result_df.columns
+                }, inplace=True)
+
+        return result_df, all_metas, col_layout, group_cols, groups, group_counts
+
+    def _get_pvalue_injections(
+        self, row_metas: List[Dict]
+    ) -> List[Tuple[int, str, str, bool]]:
+        """
+        Convert RowMeta pvalue_span entries into (row_k, p_str, test_str, is_middle) tuples.
+        row_k is the flat_df row index AFTER which the separator gets the p-value.
+        is_middle is True only for the central separator row.
+        """
+        injections = []
+        for meta in row_metas:
+            span = meta.get("pvalue_span")
+            if span is None:
+                continue
+            p_str, test_str, cat_start_abs, n_cats = span
+            if not p_str and not test_str:
+                continue
+            middle_k = cat_start_abs + (n_cats - 1) // 2
+            for i in range(n_cats - 1):
+                k = cat_start_abs + i
+                is_middle = (k == middle_k)
+                injections.append((k, p_str, test_str, is_middle))
+        return injections
+
+    def _run_data_quality_checks(
+        self, df: pd.DataFrame, variables: List[str]
+    ) -> List[str]:
+        """
+        Run optional Tukey outlier and Hartigan Dip Test checks on numeric variables.
+        Returns a list of footnote strings (may be empty).
+        """
+        footnotes: List[str] = []
+
+        numeric_vars = [
+            v for v in variables
+            if v in df.columns and pd.api.types.is_numeric_dtype(df[v])
+        ]
+
+        if self.config.check_outliers:
+            outlier_vars = []
+            for v in numeric_vars:
+                s = df[v].dropna()
+                if len(s) < 4:
+                    continue
+                q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                iqr = q3 - q1
+                lo, hi = q1 - 3 * iqr, q3 + 3 * iqr
+                if ((s < lo) | (s > hi)).any():
+                    outlier_vars.append(v)
+            if outlier_vars:
+                footnotes.append(f"[*] Outliers detected in: {', '.join(outlier_vars)}")
+
+        if self.config.check_multimodal:
+            try:
+                import diptest  # type: ignore
+                multimodal_vars = []
+                for v in numeric_vars:
+                    s = df[v].dropna().values
+                    if len(s) < 4:
+                        continue
+                    _, pval = diptest.diptest(s)
+                    if pval < 0.05:
+                        multimodal_vars.append(v)
+                if multimodal_vars:
+                    footnotes.append(
+                        f"[\u2020] Multimodal distribution detected in: {', '.join(multimodal_vars)}"
+                    )
+            except ImportError:
+                logger.warning(
+                    "check_multimodal=True but 'diptest' package is not installed; "
+                    "skipping Hartigan Dip Test."
+                )
+
+        return footnotes
+
+    def _decorate_df_output(
+        self,
+        df: pd.DataFrame,
+        row_metas: List[Dict],
+        col_layout,
+    ) -> pd.DataFrame:
+        """Return a DataFrame suitable for DataFrame output only.
+
+        This decorates categorical variable header rows with the p-value
+        and test name so the returned DataFrame contains the same test
+        metadata shown in the text rendering.
+        """
+        if col_layout.p_idx is None:
+            return df
+
+        out = df.copy()
+        for row_idx, meta in enumerate(row_metas):
+            if meta.get("kind") != "var_header":
+                continue
+            span = meta.get("pvalue_span")
+            if span is None:
+                continue
+            p_str, test_str, *_ = span
+            if p_str and col_layout.p_idx < out.shape[1]:
+                out.iat[row_idx, col_layout.p_idx] = p_str
+            if (test_str and col_layout.test_idx is not None
+                    and col_layout.test_idx < out.shape[1]):
+                out.iat[row_idx, col_layout.test_idx] = test_str
+        return out
+
+    def _attach_title_footnote(
+        self,
+        df: pd.DataFrame,
+        title: Optional[str],
+        footnote: Optional[str],
+    ) -> pd.DataFrame:
+        """
+        Prepend title row and/or append footnote row to the DataFrame.
+        Both appear in the first column; all other columns are empty.
+        """
+        if not title and not footnote:
+            return df
+
+        n_cols  = len(df.columns)
+        empty   = [""] * n_cols
+        parts   = []
+
+        if title:
+            r       = empty.copy()
+            r[0]    = title
+            parts.append(pd.DataFrame([r], columns=df.columns))
+
+        parts.append(df)
+
+        if footnote:
+            r       = empty.copy()
+            r[0]    = footnote
+            parts.append(pd.DataFrame([r], columns=df.columns))
+
+        return pd.concat(parts, ignore_index=True)
+
+    # =========================================================================
+    # Formula parsing & validation
+    # =========================================================================
+
+    def _parse_formula(self, df, formula):
+        if "|" in formula:
+            vars_part, group_part = formula.split("|", 1)
+            group_cols = [g.strip() for g in group_part.split("+") if g.strip()]
+        else:
+            vars_part  = formula
+            group_cols = []
+
+        vars_part = vars_part.replace("~", "").strip()
+        if vars_part.startswith("."):
+            exclude = set(group_cols)
+            rest = vars_part[1:].strip()
+            if rest:
+                for excl in rest.split("-"):
+                    excl = excl.strip()
+                    if excl:
+                        exclude.add(excl)
+            variables = [c for c in df.columns if c not in exclude]
+        else:
+            variables = [t.strip() for t in vars_part.split("+") if t.strip()]
+
+        valid_vars   = [v for v in variables  if v in df.columns]
+        valid_groups = [g for g in group_cols if g in df.columns]
+
+        missing_v = set(variables)  - set(valid_vars)
+        missing_g = set(group_cols) - set(valid_groups)
+        if missing_v: logger.warning("Variables not in DataFrame: %s", missing_v)
+        if missing_g: logger.warning("Group cols not in DataFrame: %s", missing_g)
+
+        return valid_vars, valid_groups
+
+    def _validate_dataframe(self, df, variables, group_cols):
+        if df.columns.duplicated().any():
+            dupes = df.columns[df.columns.duplicated()].tolist()
+            raise ValueError(f"Duplicate columns: {dupes}")
+        for g in group_cols:
+            if df[g].nunique(dropna=True) < 2:
+                logger.warning("Group '%s' has <2 unique values; tests skipped.", g)
+        for v in variables:
+            if df[v].isna().all():
+                logger.warning("Variable '%s' is entirely NaN.", v)
+
+    # =========================================================================
+    # Render-type detection
+    # =========================================================================
+
+    _CATEGORICAL_FMT_TOKENS = frozenset(
+        {"n_percent", "pct_only", "n_only", "n_total_pct", "n_pct"}
+    )
+
+    def _get_render_type(self, df, var, max_cardinality=5):
+        cfg = self.config.render_config
+        if var in cfg:
+            if cfg[var] in ("mean_sd", "median_iqr"):
+                return "numeric"
+            if cfg[var] in self._CATEGORICAL_FMT_TOKENS:
+                return "categorical"
+        series = df[var]
+        if pd.api.types.is_numeric_dtype(series):
+            if (pd.api.types.is_integer_dtype(series)
+                    and series.nunique() <= max_cardinality):
+                return "categorical"
+            return "numeric"
+        return "categorical"
+
+    # =========================================================================
+    # Group structure helpers
+    # =========================================================================
+
+    def _get_groups(self, df, group_cols):
+        if not group_cols:
+            return []
+        if len(group_cols) == 1:
+            s = df[group_cols[0]].dropna()
+            if hasattr(s, "cat") and s.cat.ordered:
+                present = set(s.unique())
+                return [c for c in s.cat.categories if c in present]
+            unique = s.unique()
+            try:    return sorted(unique, key=self._natural_key)
+            except: return sorted(str(v) for v in unique)
+        else:
+            df_clean = df.dropna(subset=group_cols)
+            grp = df_clean.groupby(group_cols, observed=True)
+            try:    return sorted(grp.groups.keys())
+            except: return sorted(grp.groups.keys(),
+                                  key=lambda x: tuple(str(v) for v in x))
+
+    def _compute_group_counts(self, df, group_cols, groups):
+        if not group_cols:
+            return {}
+        return {g: int(self._get_group_mask(df, group_cols, g).sum())
+                for g in groups}
+
+    def _get_group_mask(self, df, group_cols, g_tuple):
+        mask = pd.Series(True, index=df.index)
+        for i, col in enumerate(group_cols):
+            val = g_tuple if len(group_cols) == 1 else g_tuple[i]
+            mask &= df[col] == val
+        return mask
+
+    # =========================================================================
+    # Render-spec resolution
+    # =========================================================================
+
+    def _get_render_specs(self, var):
+        rc = self.config.render_continuous
+        if isinstance(rc, dict):
+            return rc.get(var, rc.get("__default__", []))
+        return rc if isinstance(rc, list) else []
+
+    # =========================================================================
+    # Percentage denominator
+    # =========================================================================
+
+    def _get_cat_denom(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        g_tuple: Any,
+        parent_counts: Dict[Any, int],
+    ) -> int:
+        """
+        Return the denominator for the percentage of a categorical cell.
+
+        parent_counts : {g_tuple → n_valid_for_parent_group}
+                        Pre-computed in _summarize_categorical when
+                        pct_denominator == 'parent_group'.
+        """
+        mode = self.config.pct_denominator
+        if mode == "total":
+            return int(df[var].count())
+        if mode == "parent_group" and len(group_cols) > 1:
+            return parent_counts.get(g_tuple, 1)
+        # 'group' (default)
+        mask = self._get_group_mask(df, group_cols, g_tuple)
+        return int(df.loc[mask, var].count())
+
+    # =========================================================================
+    # Numeric summarization
+    # =========================================================================
+
+    def _summarize_numeric(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        groups: List[Any],
+        paired: bool = False,
+        var_label: Optional[str] = None,
+    ) -> Tuple[List[List[Any]], List[Dict]]:
+        """Returns (rows, metas)."""
+        cfg           = self.config
+        rows: List    = []
+        metas: List   = []
+        resolved_test = self.test_resolver.resolve(var, group_cols, "numeric")
+        specs         = self._get_render_specs(var)
+        overall_hdr   = self._calc_overall_header(df, var)
+
+        # var_header row — append footnote marker if configured
+        _marker  = self.config.var_footnotes.get(var, "")
+        _num_label = f"{var_label or var}{_marker}"
+        row_main = self._make_header_row(_num_label, overall_hdr, group_cols, groups)
+        rows.append(row_main)
+        metas.append({"kind": "var_header", "var": var, "pvalue_span": None})
+
+        if specs:
+            for idx, spec in enumerate(specs):
+                if " = " not in spec:
+                    logger.warning("Invalid render spec: %s", spec)
+                    continue
+
+                label_text, formula = spec.split(" = ", 1)
+                row_s = [self._indent(label_text.strip())]
+
+                val_overall = self._compute_stat(df[var].dropna(), formula)
+                if cfg.display_overall and cfg.overall_position == "first":
+                    self._append_total(row_s, hdr_str=val_overall)
+
+                group_series: List[pd.Series] = []
+                for g_tuple in groups:
+                    mask   = self._get_group_mask(df, group_cols, g_tuple)
+                    subset = df.loc[mask, var].dropna()
+                    group_series.append(subset)
+                    row_s.append(self._compute_stat(subset, formula)
+                                 if len(subset) > 0 else cfg.missing_value_symbol)
+                    if cfg.split_count_pct:
+                        row_s.append("")   # empty % cell for numeric rows
+
+                if cfg.display_overall and cfg.overall_position == "last":
+                    self._append_total(row_s, hdr_str=val_overall)
+
+                raw_p_spec = None
+                if group_cols and cfg.display_p_values:
+                    if idx == 0:
+                        p, test = self._calculate_pvalue_numeric(
+                            group_series, resolved_test, paired)
+                        raw_p_spec = p
+                        row_s.append(self._format_p(p))
+                        if cfg.display_test_name:
+                            row_s.append(test)
+                    else:
+                        row_s.append("")
+                        if cfg.display_test_name:
+                            row_s.append("")
+
+                if group_cols and cfg.display_smd:
+                    if idx == 0 and len(groups) == 2:
+                        row_s.append(self._compute_smd_numeric(
+                            group_series[0], group_series[1]))
+                    else:
+                        row_s.append("")
+
+                rows.append(row_s)
+                spec_meta: Dict = {"kind": "stat", "var": var, "pvalue_span": None,
+                                   "raw_p": raw_p_spec}
+                if cfg.show_normality_method and group_cols and idx == 0:
+                    norm_descs = [
+                        self.normality_selector.test(gs)[1] for gs in group_series
+                    ]
+                    spec_meta["normality_info"] = (var, norm_descs)
+                metas.append(spec_meta)
+        else:
+            metric = cfg.render_config.get(
+                var, cfg.render_config.get("default_numeric", "median_iqr"))
+            label  = "Mean (SD)" if metric == "mean_sd" else "Median [IQR]"
+            row_s  = [self._indent(label)]
+
+            val_overall = self._format_numeric_stats(df[var].dropna(), metric)
+            if cfg.display_overall and cfg.overall_position == "first":
+                self._append_total(row_s, hdr_str=val_overall)
+
+            group_series = []
+            for g_tuple in groups:
+                mask   = self._get_group_mask(df, group_cols, g_tuple)
+                subset = df.loc[mask, var].dropna()
+                group_series.append(subset)
+                row_s.append(self._format_numeric_stats(subset, metric)
+                             if len(subset) > 0 else cfg.missing_value_symbol)
+                if cfg.split_count_pct:
+                    row_s.append("")   # empty % cell for numeric rows
+
+            if cfg.display_overall and cfg.overall_position == "last":
+                self._append_total(row_s, hdr_str=val_overall)
+
+            raw_p_default = None
+            if group_cols and cfg.display_p_values:
+                p, test = self._calculate_pvalue_numeric(
+                    group_series, resolved_test, paired)
+                raw_p_default = p
+                row_s.append(self._format_p(p))
+                if cfg.display_test_name:
+                    row_s.append(test)
+
+            if group_cols and cfg.display_smd:
+                row_s.append(self._compute_smd_numeric(
+                    group_series[0], group_series[1])
+                    if len(groups) == 2 else "")
+
+            stat_meta: Dict = {"kind": "stat", "var": var, "pvalue_span": None,
+                               "raw_p": raw_p_default}
+            if cfg.show_normality_method and group_cols:
+                norm_descs = [
+                    self.normality_selector.test(gs)[1] for gs in group_series
+                ]
+                stat_meta["normality_info"] = (var, norm_descs)
+            rows.append(row_s)
+            metas.append(stat_meta)
+
+        if cfg.display_missing:
+            miss = self._make_missing_row(df, var, group_cols, groups)
+            if miss is not None:
+                rows.append(miss)
+                metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        return rows, metas
+
+    # =========================================================================
+    # Categorical summarization
+    # =========================================================================
+
+    def _summarize_categorical(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        groups: List[Any],
+        paired: bool = False,
+        var_label: Optional[str] = None,
+        val_map: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[List[Any]], List[Dict]]:
+        """Returns (rows, metas)."""
+        cfg          = self.config
+        val_map      = val_map or {}
+        rows: List   = []
+        metas: List  = []
+
+        # ── NaN as explicit category ──────────────────────────────────────
+        if cfg.include_nan_as_category:
+            import warnings as _warnings
+            if cfg.display_missing:
+                _warnings.warn(
+                    f"include_nan_as_category=True with display_missing=True for '{var}': "
+                    "the Missing row will show 0. Consider setting display_missing=False.",
+                    UserWarning,
+                    stacklevel=5,
+                )
+            working_col = f"__tabstat_nan_{var}__"
+            df = df.copy()
+            df[working_col] = df[var].fillna(cfg.nan_category_label).astype(str)
+            _var_for_ops = working_col
+        else:
+            _var_for_ops = var
+
+        series = df[_var_for_ops].dropna() if not cfg.include_nan_as_category else df[_var_for_ops]
+        if hasattr(series, "cat") and series.cat.ordered:
+            present = set(series.unique())
+            categories = [c for c in series.cat.categories if c in present]
+        else:
+            try:
+                categories = sorted(series.unique(), key=self._natural_key)
+            except Exception:
+                categories = sorted(str(c) for c in series.unique())
+        is_binary     = len(categories) == 2
+        overall_hdr   = self._calc_overall_header(df, var)
+        resolved_test = self.test_resolver.resolve(var, group_cols, "categorical")
+
+        # ── P-value ───────────────────────────────────────────────────────
+        p_value, test_name = np.nan, ""
+        if group_cols:
+            p_value, test_name = self._calculate_pvalue_categorical(
+                df, _var_for_ops, group_cols, resolved_test, paired)
+        p_str = self._format_p(p_value) if group_cols else ""
+
+        # ── SMD (binary, 2-group only) ─────────────────────────────────────
+        smd_str = ""
+        if group_cols and cfg.display_smd and is_binary and len(groups) == 2:
+            ref_cat = categories[-1]
+            s1 = df.loc[self._get_group_mask(df, group_cols, groups[0]), _var_for_ops].dropna()
+            s2 = df.loc[self._get_group_mask(df, group_cols, groups[1]), _var_for_ops].dropna()
+            p1 = (s1 == ref_cat).sum() / len(s1) if len(s1) > 0 else 0.0
+            p2 = (s2 == ref_cat).sum() / len(s2) if len(s2) > 0 else 0.0
+            smd_str = self._compute_smd_binary(p1, p2)
+
+        # ── Pre-compute parent group counts for pct_denominator='parent_group' ──
+        parent_counts: Dict[Any, int] = {}
+        if cfg.pct_denominator == "parent_group" and len(group_cols) > 1:
+            parent_col = group_cols[0]
+            for g in groups:
+                parent_key  = g[0] if isinstance(g, tuple) else g
+                parent_mask = df[parent_col] == parent_key
+                parent_counts[g] = int(df.loc[parent_mask, _var_for_ops].count())
+
+        n_valid_total = (len(df) if cfg.include_nan_as_category
+                         else int(df[_var_for_ops].count()))
+
+        # ── Footnote marker ───────────────────────────────────────────────
+        _marker = cfg.var_footnotes.get(var, "")
+        _base_label = var_label or var
+
+        # ── Binary collapse → single row, p-value directly in cell ───────
+        if is_binary and cfg.collapse_binary:
+            cat   = (categories[-1] if cfg.collapse_binary_level == "last"
+                     else categories[0])
+            label = f"{_base_label}{_marker}, {val_map.get(str(cat), str(cat))}"
+            row   = [label]
+
+            n_cat  = int((df[_var_for_ops] == cat).sum())
+            pct_ov = (n_cat / n_valid_total * 100) if n_valid_total > 0 else 0.0
+
+            if cfg.display_overall and cfg.overall_position == "first":
+                self._append_total(row, n=n_cat, pct=pct_ov)
+            for g_tuple in groups:
+                mask  = self._get_group_mask(df, group_cols, g_tuple)
+                sub   = df.loc[mask, _var_for_ops]
+                denom = self._get_cat_denom(df, _var_for_ops, group_cols, g_tuple, parent_counts)
+                n_gc  = int((sub == cat).sum())
+                pct   = (n_gc / denom * 100) if denom > 0 else 0.0
+                if cfg.split_count_pct:
+                    row.append(str(n_gc))
+                    row.append(f"{pct:.{cfg.decimals}f}%")
+                else:
+                    row.append(self._format_cat_cell(n_gc, denom, var))
+            if cfg.display_overall and cfg.overall_position == "last":
+                self._append_total(row, n=n_cat, pct=pct_ov)
+            if group_cols and cfg.display_p_values:
+                row.append(p_str)
+                if cfg.display_test_name:
+                    row.append(test_name)
+            if group_cols and cfg.display_smd:
+                row.append(smd_str)
+
+            rows.append(row)
+            metas.append({"kind": "var_header", "var": var, "pvalue_span": None,
+                           "raw_p": p_value if group_cols else None})
+
+            if cfg.display_missing:
+                miss = self._make_missing_row(df, var, group_cols, groups)
+                if miss is not None:
+                    rows.append(miss)
+                    metas.append({"kind": "missing", "var": var, "pvalue_span": None,
+                                   "raw_p": None})
+
+            return rows, metas
+
+        # ── Standard multi-row (header + one row per category) ───────────
+        row_main = self._make_header_row(f"{_base_label}{_marker}", overall_hdr, group_cols, groups)
+        # SMD on the var_header (last column if display_smd)
+        if group_cols and cfg.display_smd and smd_str:
+            row_main[-1] = smd_str
+        rows.append(row_main)
+
+        # pvalue_span: (p_str, test_str, cat_offset=1, n_cats)
+        # cat_offset=1 → categories start 1 row below this header in local list
+        span = None
+        if group_cols and cfg.display_p_values and len(categories) >= 1:
+            span = (p_str, test_name, 1, len(categories))
+        metas.append({"kind": "var_header", "var": var, "pvalue_span": span,
+                       "raw_p": p_value if group_cols else None})
+
+        for cat in categories:
+            row_cat = [self._indent(val_map.get(str(cat), str(cat)))]
+
+            n_cat_tot = int((df[_var_for_ops] == cat).sum())
+            pct_tot   = (n_cat_tot / n_valid_total * 100) if n_valid_total > 0 else 0.0
+
+            if cfg.display_overall and cfg.overall_position == "first":
+                self._append_total(row_cat, n=n_cat_tot, pct=pct_tot)
+
+            for g_tuple in groups:
+                mask  = self._get_group_mask(df, group_cols, g_tuple)
+                sub   = df.loc[mask, _var_for_ops]
+                denom = self._get_cat_denom(df, _var_for_ops, group_cols, g_tuple, parent_counts)
+                n_gc  = int((sub == cat).sum())
+                pct   = (n_gc / denom * 100) if denom > 0 else 0.0
+                if cfg.split_count_pct:
+                    row_cat.append(str(n_gc))
+                    row_cat.append(f"{pct:.{cfg.decimals}f}%")
+                else:
+                    row_cat.append(self._format_cat_cell(n_gc, denom, var))
+
+            if cfg.display_overall and cfg.overall_position == "last":
+                self._append_total(row_cat, n=n_cat_tot, pct=pct_tot)
+
+            # P-value and test: ALWAYS EMPTY in category rows
+            # (they will be injected into the separator line by render_text_table)
+            if group_cols and cfg.display_p_values:
+                row_cat.append("")
+                if cfg.display_test_name:
+                    row_cat.append("")
+
+            # SMD already in var_header
+            if group_cols and cfg.display_smd:
+                row_cat.append("")
+
+            rows.append(row_cat)
+            metas.append({"kind": "category", "var": var, "pvalue_span": None})
+
+        if cfg.display_missing:
+            miss = self._make_missing_row(df, var, group_cols, groups)
+            if miss is not None:
+                rows.append(miss)
+                metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        return rows, metas
+
+    # =========================================================================
+    # Row builders
+    # =========================================================================
+
+    def _append_total(self, row, hdr_str=None, n=None, pct=None):
+        """Append 1 or 2 Total cells depending on split_count_pct."""
+        cfg = self.config
+        if cfg.split_count_pct:
+            row.append(str(n) if n is not None else (hdr_str or ""))
+            row.append(f"{pct:.{cfg.decimals}f}%" if pct is not None else "")
+        else:
+            if n is not None and pct is not None:
+                row.append(f"{n} ({pct:.{cfg.decimals}f}%)")
+            else:
+                row.append(hdr_str or "")
+
+    def _make_header_row(self, label, overall_hdr, group_cols, groups):
+        cfg = self.config
+        row = [label]
+        if cfg.display_overall and cfg.overall_position == "first":
+            self._append_total(row, hdr_str=overall_hdr)
+        if group_cols:
+            empties = 2 if cfg.split_count_pct else 1
+            row.extend([""] * len(groups) * empties)
+        if cfg.display_overall and cfg.overall_position == "last":
+            self._append_total(row, hdr_str=overall_hdr)
+        if group_cols and cfg.display_p_values:
+            row.append("")
+            if cfg.display_test_name:
+                row.append("")
+        if group_cols and cfg.display_smd:
+            row.append("")
+        return row
+
+    def _make_missing_row(self, df, var, group_cols, groups):
+        cfg     = self.config
+        n_miss  = int(df[var].isna().sum())
+        if n_miss == 0:
+            return None
+        n_total = len(df)
+        pct_ov  = (n_miss / n_total * 100) if n_total > 0 else 0.0
+
+        row = [self._indent("Missing")]
+        if cfg.display_overall and cfg.overall_position == "first":
+            self._append_total(row, n=n_miss, pct=pct_ov)
+        for g_tuple in groups:
+            mask     = self._get_group_mask(df, group_cols, g_tuple)
+            sub      = df.loc[mask, var]
+            n_miss_g = int(sub.isna().sum())
+            pct_g    = (n_miss_g / len(sub) * 100) if len(sub) > 0 else 0.0
+            if cfg.split_count_pct:
+                row.append(str(n_miss_g))
+                row.append(f"{pct_g:.{cfg.decimals}f}%")
+            else:
+                row.append(f"{n_miss_g} ({pct_g:.{cfg.decimals}f}%)")
+        if cfg.display_overall and cfg.overall_position == "last":
+            self._append_total(row, n=n_miss, pct=pct_ov)
+        if group_cols and cfg.display_p_values:
+            row.append("")
+            if cfg.display_test_name:
+                row.append("")
+        if group_cols and cfg.display_smd:
+            row.append("")
+        return row
+
+    # =========================================================================
+    # Column index construction
+    # =========================================================================
+
+    def _build_columns(self, df, group_cols, groups, group_counts):
+        cfg = self.config
+        t   = self._titles()
+        if not group_cols:
+            cols = [t["characteristic"]]
+            if cfg.display_overall:
+                cols.append(f"{t['total']} (n={len(df)})")
+            return pd.Index(cols)
+
+        final_cols = []
+        if len(group_cols) == 1:
+            grp_name = group_cols[0]
+            # extra empty level so all tuples are the same length when split
+            x = ("",) if cfg.split_count_pct else ()
+            final_cols.append((t["characteristic"], "") + x)
+            if cfg.display_overall and cfg.overall_position == "first":
+                if cfg.split_count_pct:
+                    final_cols.append((t["total"], f"(n={len(df)})", "n"))
+                    final_cols.append((t["total"], f"(n={len(df)})", "%"))
+                else:
+                    final_cols.append((t["total"], f"(n={len(df)})"))
+            for g in groups:
+                n = group_counts.get(g, "?")
+                if cfg.split_count_pct:
+                    final_cols.append((grp_name, f"{g} (n={n})", "n"))
+                    final_cols.append((grp_name, f"{g} (n={n})", "%"))
+                else:
+                    final_cols.append((grp_name, f"{g} (n={n})"))
+            if cfg.display_overall and cfg.overall_position == "last":
+                if cfg.split_count_pct:
+                    final_cols.append((t["total"], f"(n={len(df)})", "n"))
+                    final_cols.append((t["total"], f"(n={len(df)})", "%"))
+                else:
+                    final_cols.append((t["total"], f"(n={len(df)})"))
+            if cfg.display_p_values:
+                final_cols.append((t["p_value"], "") + x)
+                if cfg.display_test_name:
+                    final_cols.append((t["test"], "") + x)
+            if cfg.display_smd:
+                final_cols.append((t["smd"], "") + x)
+        else:
+            # pad fills all group-level positions; extra for split
+            pad  = ("",) * len(group_cols)
+            xpad = pad + (("",) if cfg.split_count_pct else ())
+            final_cols.append((t["characteristic"],) + xpad)
+            if cfg.display_overall and cfg.overall_position == "first":
+                if cfg.split_count_pct:
+                    final_cols.append((t["total"],) + pad + ("n",))
+                    final_cols.append((t["total"],) + pad + ("%",))
+                else:
+                    final_cols.append((t["total"],) + pad)
+            for g in groups:
+                n = group_counts.get(g, "?")
+                if cfg.split_count_pct:
+                    final_cols.append(g + (f"(n={n})", "n"))
+                    final_cols.append(g + (f"(n={n})", "%"))
+                else:
+                    final_cols.append(g + (f"(n={n})",))
+            if cfg.display_overall and cfg.overall_position == "last":
+                if cfg.split_count_pct:
+                    final_cols.append((t["total"],) + pad + ("n",))
+                    final_cols.append((t["total"],) + pad + ("%",))
+                else:
+                    final_cols.append((t["total"],) + pad)
+            if cfg.display_p_values:
+                final_cols.append((t["p_value"],) + xpad)
+                if cfg.display_test_name:
+                    final_cols.append((t["test"],) + xpad)
+            if cfg.display_smd:
+                final_cols.append((t["smd"],) + pad)
+
+        return pd.MultiIndex.from_tuples(final_cols)
+
+    # =========================================================================
+    # Statistical tests
+    # =========================================================================
+
+    def _calculate_pvalue_numeric(self, groups_data, resolved_test, paired=False):
+        valid = [g.dropna() for g in groups_data if len(g.dropna()) > 1]
+        if len(valid) < 2:
+            return np.nan, "N/A"
+
+        if resolved_test == "mannwhitneyu":
+            if len(valid) == 2:
+                _, p = mannwhitneyu(*valid, alternative="two-sided")
+                return p, "Mann-Whitney U"
+            _, p = kruskal(*valid); return p, "Kruskal-Wallis"
+        if resolved_test in ("ttest", "student"):
+            if len(valid) == 2:
+                _, p = ttest_ind(*valid, equal_var=True)
+                return p, "Student's t-test"
+            _, p = f_oneway(*valid); return p, "ANOVA"
+        if resolved_test == "welch":
+            if len(valid) == 2:
+                _, p = ttest_ind(*valid, equal_var=False)
+                return p, "Welch's t-test"
+            _, p = f_oneway(*valid); return p, "ANOVA"
+        if resolved_test == "kruskal":
+            _, p = kruskal(*valid); return p, "Kruskal-Wallis"
+        if resolved_test == "anova":
+            _, p = f_oneway(*valid); return p, "ANOVA"
+
+        is_normal = (False if resolved_test == "never_parametric"
+                     else True if resolved_test == "always_parametric"
+                     else self.normality_selector.all_normal(valid))
+
+        if paired and len(valid) == 2:
+            if is_normal:
+                _, p = ttest_rel(valid[0], valid[1]); return p, "Paired t-test"
+            _, p = wilcoxon(valid[0], valid[1]); return p, "Wilcoxon Signed-Rank"
+        if len(valid) == 2:
+            if is_normal:
+                lev_p  = levene(*valid)[1]
+                eq_var = lev_p >= 0.05
+                _, p   = ttest_ind(valid[0], valid[1], equal_var=eq_var)
+                return p, ("Student's t-test" if eq_var else "Welch's t-test")
+            _, p = mannwhitneyu(*valid, alternative="two-sided")
+            return p, "Mann-Whitney U"
+        if is_normal:
+            _, p = f_oneway(*valid); return p, "ANOVA"
+        _, p = kruskal(*valid); return p, "Kruskal-Wallis"
+
+    def _calculate_pvalue_categorical(self, df, var, group_cols, resolved_test, paired=False):
+        tmp = df.copy()
+        if len(group_cols) == 1:
+            g_col = group_cols[0]
+        else:
+            g_col = "_grp_combined_"
+            tmp[g_col] = tmp[group_cols].astype(str).agg("_".join, axis=1)
+
+        ct = pd.crosstab(tmp[var], tmp[g_col])
+        if ct.size == 0:
+            return np.nan, "N/A"
+
+        if paired:
+            if ct.shape == (2, 2):
+                return _mcnemar_exact(ct), "McNemar Test (exact)"
+            return np.nan, "McNemar (N/A for >2×2)"
+
+        if resolved_test == "chi2":
+            _, p, _, _ = chi2_contingency(ct); return p, "Chi-Squared"
+        if resolved_test == "fisher":
+            if ct.shape == (2, 2):
+                _, p = fisher_exact(ct); return p, "Fisher Exact"
+            _, p, _, _ = chi2_contingency(ct)
+            return p, "Chi-Squared (Fisher N/A >2×2)"
+
+        # auto: expected-cell rule
+        if ct.shape == (2, 2):
+            _, p_chi, _, expected = chi2_contingency(ct)
+            if expected.min() < 5 or (expected < 1).any():
+                _, p = fisher_exact(ct); return p, "Fisher Exact"
+            return p_chi, "Chi-Squared"
+        _, p, _, _ = chi2_contingency(ct); return p, "Chi-Squared"
+
+    # =========================================================================
+    # SMD
+    # =========================================================================
+
+    # =========================================================================
+    # Categorical cell formatting helpers
+    # =========================================================================
+
+    def _format_cat_cell(self, n_gc: int, denom: int, var: str) -> str:
+        """
+        Format a single categorical count cell.
+
+        Respects cfg.categorical_fmt (global) and render_config per-variable
+        overrides ('pct_only', 'n_only', 'n_total_pct').
+        When cfg.show_proportion_ci=True and cfg.split_count_pct=False,
+        appends Wilson CI as  [lo%–hi%].
+        """
+        cfg = self.config
+        d   = cfg.decimals
+        pct = (n_gc / denom * 100) if denom > 0 else 0.0
+
+        _cat_fmts = {"pct_only", "n_only", "n_total_pct", "n_pct"}
+        raw_fmt = cfg.render_config.get(var, cfg.categorical_fmt)
+        fmt = raw_fmt if raw_fmt in _cat_fmts else cfg.categorical_fmt
+
+        if fmt == "pct_only":
+            base = f"{pct:.{d}f}%"
+        elif fmt == "n_only":
+            base = str(n_gc)
+        elif fmt == "n_total_pct":
+            base = f"{n_gc}/{denom} ({pct:.{d}f}%)"
+        else:
+            base = f"{n_gc} ({pct:.{d}f}%)"
+
+        if cfg.show_proportion_ci and not cfg.split_count_pct and fmt not in ("n_only",):
+            ci = self._wilson_ci(n_gc, denom, cfg.ci_level)
+            if ci is not None:
+                lo_pct = ci[0] * 100
+                hi_pct = ci[1] * 100
+                base += f" [{lo_pct:.{d}f}%\u2013{hi_pct:.{d}f}%]"
+
+        return base
+
+    def _wilson_ci(
+        self, k: int, n: int, level: float
+    ) -> Optional[Tuple[float, float]]:
+        """Wilson score confidence interval for a proportion k/n."""
+        if n <= 0:
+            return None
+        from scipy.stats import norm as _norm
+        z  = _norm.ppf(1.0 - (1.0 - level) / 2.0)
+        z2 = z * z
+        center = (k + z2 / 2.0) / (n + z2)
+        hw     = z * np.sqrt(k * (n - k) / n + z2 / 4.0) / (n + z2)
+        return (max(0.0, center - hw), min(1.0, center + hw))
+
+    def _compute_smd_numeric(self, g1, g2):
+        g1, g2 = g1.dropna(), g2.dropna()
+        if len(g1) < 2 or len(g2) < 2:
+            return ""
+        pooled_sd = np.sqrt((g1.var(ddof=1) + g2.var(ddof=1)) / 2.0)
+        return "" if pooled_sd == 0 else f"{abs(g1.mean()-g2.mean())/pooled_sd:.2f}"
+
+    def _compute_smd_binary(self, p1, p2):
+        p_avg = (p1 + p2) / 2.0
+        denom = np.sqrt(p_avg * (1.0 - p_avg)) if 0.0 < p_avg < 1.0 else 0.0
+        return "" if denom == 0 else f"{abs(p1-p2)/denom:.2f}"
+
+    # =========================================================================
+    # Formatting helpers
+    # =========================================================================
+
+    def _calc_overall_header(self, df, var):
+        n_total = len(df)
+        n_valid = int(df[var].count())
+        pct     = (n_valid / n_total * 100) if n_total > 0 else 0.0
+        mode    = self.config.total_mode
+        if mode == "n":          return str(n_total)
+        if mode == "n_valid":    return str(n_valid)
+        return f"{n_valid} ({pct:.{self.config.decimals}f}%)"
+
+    def _format_numeric_stats(self, data, metric):
+        data = data.dropna()
+        if len(data) == 0:
+            return self.config.missing_value_symbol
+        d = self.config.decimals
+        if metric == "mean_sd":
+            return f"{data.mean():.{d}f} ({data.std():.{d}f})"
+        med = data.median()
+        return f"{med:.{d}f} [{data.quantile(.25):.{d}f}–{data.quantile(.75):.{d}f}]"
+
+    _STAT_TOKENS = frozenset(
+        {"mean", "std", "var", "median", "min", "max", "n"}
+    )
+
+    def _compute_stat(self, data, formula):
+        data = data.dropna()
+        if len(data) == 0:
+            return self.config.missing_value_symbol
+        d      = self.config.decimals
+        result = formula.strip()
+        # Percentile tokens: p25, p75, p05 …
+        for num in set(re.findall(r"p(\d+)", result)):
+            val    = data.quantile(int(num) / 100)
+            result = re.sub(rf"\bp{num}\b", f"{val:.{d}f}", result)
+        # Named statistic tokens
+        for key, func in [
+            ("mean",   lambda s: s.mean()),
+            ("std",    lambda s: s.std()),
+            ("var",    lambda s: s.var()),
+            ("median", lambda s: s.median()),
+            ("min",    lambda s: s.min()),
+            ("max",    lambda s: s.max()),
+            ("n",      lambda s: len(s)),
+        ]:
+            if re.search(rf"\b{key}\b", result):
+                val = func(data)
+                # n is an integer — no decimal formatting
+                fmt = str(int(val)) if key == "n" else f"{val:.{d}f}"
+                result = re.sub(rf"\b{key}\b", fmt, result)
+        # Warn on leftover word tokens that were not substituted
+        unknown = re.findall(r"\b[a-zA-Z_][a-zA-Z_0-9]*\b", result)
+        if unknown:
+            logger.warning(
+                "render_continuous: unrecognised token(s) in formula %r: %s",
+                formula,
+                ", ".join(unknown),
+            )
+        return result
+
+    def _format_p(self, p):
+        if pd.isna(p):   return ""
+        if p < 0.001:    return "<0.001"
+        return f"{p:.{self.config.p_decimals}f}"
+
+    def _apply_correction(self, pvalues: List[float]) -> List[float]:
+        """Apply multiple testing correction to a list of raw p-values."""
+        import numpy as np
+        arr = np.array(pvalues, dtype=float)
+        method = self.config.correction
+
+        if method == "bonferroni":
+            return list(np.minimum(arr * len(arr), 1.0))
+
+        if method == "fdr_bh":
+            try:
+                from scipy.stats import false_discovery_control
+                return list(false_discovery_control(arr, method="bh"))
+            except ImportError:
+                pass
+            try:
+                from statsmodels.stats.multitest import multipletests
+                _, corrected, _, _ = multipletests(arr, method="fdr_bh")
+                return list(corrected)
+            except ImportError:
+                logger.warning(
+                    "fdr_bh correction requires scipy >= 1.11 or statsmodels; "
+                    "returning uncorrected p-values."
+                )
+                return pvalues
+
+        return pvalues
+
+    def _indent(self, text):
+        return (self.config.indent_char + " " * self.config.indent_width) + text
+
+    def _normalize_rows(self, rows, target_len):
+        return [(r + [""] * (target_len - len(r)))[:target_len] for r in rows]
+
+    @staticmethod
+    def _flatten_multiindex_columns(df):
+        out = df.copy()
+        if isinstance(out.columns, pd.MultiIndex):
+            out.columns = [
+                "\n".join(str(c) for c in col
+                          if c and str(c).strip() not in ("", " "))
+                for col in out.columns.values
+            ]
+        return out
+
+    _DEFAULT_COLUMN_TITLES = {
+        "characteristic": "Characteristic",
+        "total":          "Total",
+        "p_value":        "P-value",
+        "test":           "Test",
+        "smd":            "SMD",
+    }
+
+    def _titles(self) -> Dict[str, str]:
+        """Merge user-supplied `cfg.column_titles` over the English defaults."""
+        return {**self._DEFAULT_COLUMN_TITLES, **(self.config.column_titles or {})}
+
+    @staticmethod
+    def _natural_key(s):
+        """Sort key that orders numeric substrings by value: '5-9' < '10-14'."""
+        return [int(t) if t.isdigit() else t.lower()
+                for t in re.split(r'(\d+)', str(s))]
+
+    @staticmethod
+    def _parse_column_labels(column_labels):
+        """
+        Normalize column_labels to (var_labels, val_maps).
+
+        Supports two formats:
+          Flat:   {"VARNAME": "Label", "group_val": "display"}
+          Nested: {"VARNAME": {"label": "Label", "map": {1: "Yes", 0: "No"}}}
+        Mixed dicts are allowed.
+        """
+        var_labels: Dict[str, str]             = {}
+        val_maps:   Dict[str, Dict[str, str]]  = {}
+        for k, v in (column_labels or {}).items():
+            k = str(k)
+            if isinstance(v, dict):
+                var_labels[k] = str(v.get("label", k))
+                val_maps[k]   = {str(mk): str(mv) for mk, mv in v.get("map", {}).items()}
+            else:
+                var_labels[k] = str(v)
+        return var_labels, val_maps
+
+    def _flatten_for_tabulate(self, df):
+        """Clean single-line column names for non-grid tabulate output."""
+        if not isinstance(df.columns, pd.MultiIndex):
+            return df
+        out = df.copy()
+        meta = set(self._titles().values())
+        names = []
+        for col in out.columns.values:
+            parts = [str(c) for c in col if str(c).strip()]
+            if not parts:
+                names.append("")
+            elif len(parts) == 1:
+                names.append(parts[0])
+            elif parts[0] in meta:
+                names.append(" ".join(parts))
+            else:
+                names.append(parts[-1])
+        out.columns = names
+        return out
+
+    def _prepare_flat_for_tabulate(self, flat_df, row_metas, col_layout):
+        """Inject categorical p-values into var_header rows; clean column names."""
+        df = self._flatten_for_tabulate(flat_df)
+        for i, meta in enumerate(row_metas):
+            span = meta.get("pvalue_span")
+            if span is None:
+                continue
+            p_str, test_str = span[0], span[1]
+            if col_layout.p_idx is not None and p_str:
+                df.iloc[i, col_layout.p_idx] = p_str
+            if col_layout.test_idx is not None and test_str:
+                df.iloc[i, col_layout.test_idx] = test_str
+        return df

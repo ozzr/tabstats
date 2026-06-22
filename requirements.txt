@@ -1,0 +1,4 @@
+﻿pandas>=1.5
+numpy>=1.23
+scipy>=1.9
+tabulate>=0.9
