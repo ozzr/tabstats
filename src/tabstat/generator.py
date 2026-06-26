@@ -586,7 +586,7 @@ class TabStatGenerator:
     # Formula parsing & validation
     # =========================================================================
 
-    _SECTION_TOKEN_RE = re.compile(r"^%(.+)%$")
+    _SECTION_TOKEN_RE = re.compile(r"^%(.+)%$|^\((.+)\)$")
 
     def _parse_formula(self, df, formula):
         if "|" in formula:
@@ -618,7 +618,8 @@ class TabStatGenerator:
                     continue
                 m = self._SECTION_TOKEN_RE.match(token)
                 if m:
-                    ordered_items.append(("__section__", m.group(1).strip()))
+                    label = (m.group(1) or m.group(2)).strip()
+                    ordered_items.append(("__section__", label))
                 else:
                     ordered_items.append(token)
                     variables.append(token)

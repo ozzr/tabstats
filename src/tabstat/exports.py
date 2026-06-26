@@ -519,17 +519,39 @@ def apply_publication_style(
         )
         first_hdr_row = 2 if has_title else 1
 
-        # ── locate header block: consecutive bold rows after the title ──
-        n_levels = 0
-        r = first_hdr_row
-        while r <= maxr and ws.cell(r, 1).font and ws.cell(r, 1).font.bold:
-            n_levels += 1
-            r += 1
-        if n_levels == 0:
-            n_levels = 1
-        hdr = first_hdr_row
-        sub = first_hdr_row + n_levels - 1
-        first_data_row = sub + 1
+        # ── locate header block via freeze_panes (reliable with section rows) ─
+        import re as _re
+        first_data_row = None
+        _fp = ws.freeze_panes
+        if _fp:
+            _fm = _re.match(r"[A-Za-z]+(\d+)", str(_fp))
+            if _fm:
+                first_data_row = int(_fm.group(1))
+        if first_data_row is not None and first_data_row > first_hdr_row:
+            n_levels = first_data_row - first_hdr_row
+            hdr = first_hdr_row
+            sub = first_data_row - 1
+        else:
+            n_levels = 0
+            r = first_hdr_row
+            while r <= maxr and ws.cell(r, 1).font and ws.cell(r, 1).font.bold:
+                n_levels += 1
+                r += 1
+            if n_levels == 0:
+                n_levels = 1
+            hdr = first_hdr_row
+            sub = first_hdr_row + n_levels - 1
+            first_data_row = sub + 1
+
+        # ── detect section rows (full-width merged rows in data area) ──────
+        sec_fill_pub = PatternFill(fill_type="solid", fgColor="EBEBEB")
+        section_rows: set = set()
+        for _rng in ws.merged_cells.ranges:
+            if (_rng.min_row == _rng.max_row
+                    and _rng.min_col == 1
+                    and _rng.max_col == maxc
+                    and _rng.min_row >= first_data_row):
+                section_rows.add(_rng.min_row)
 
         # ── locate footnote row (italic font, written by to_excel_file) ──
         footnote_row = None
@@ -557,13 +579,13 @@ def apply_publication_style(
             None,
         )
 
-        # ── 1) base: white fill, no border, base font, no gridlines ─────
+        # ── 1) base: white/section fill, no border, base font, no gridlines ─
         for row in range(1, maxr + 1):
             if row == footnote_row:
                 continue
             for col in range(1, maxc + 1):
                 cell = ws.cell(row, col)
-                cell.fill = white
+                cell.fill = sec_fill_pub if row in section_rows else white
                 cell.border = Border()
                 cell.font = Font(name=font_name, size=font_size, color="000000")
         ws.sheet_view.showGridLines = False
@@ -587,14 +609,21 @@ def apply_publication_style(
 
         # ── 4) three-line rules ──────────────────────────────────────
         for col in range(1, maxc + 1):
-            ws.cell(hdr, col).border = Border(top=medium)
-            ws.cell(sub, col).border = Border(bottom=thin)
+            ws.cell(hdr, col).border = Border(top=medium, bottom=(thin if hdr == sub else None))
+            if hdr != sub:
+                ws.cell(sub, col).border = Border(bottom=thin)
             ws.cell(last_data_row, col).border = Border(bottom=medium)
         for col in group_cols:
-            ws.cell(hdr, col).border = Border(top=medium, bottom=thin)
+            if hdr != sub:
+                ws.cell(hdr, col).border = Border(top=medium, bottom=thin)
 
         # ── 5) body: bold variable labels, indent sub-levels normal ──
         for row in range(first_data_row, last_data_row + 1):
+            if row in section_rows:
+                c = ws.cell(row, 1)
+                c.font = Font(name=font_name, size=font_size, bold=True, color="000000")
+                c.alignment = Alignment(horizontal="left", vertical="center")
+                continue
             v = str(ws.cell(row, 1).value or "")
             is_subrow = v.startswith("⠀") or v.strip().startswith(("Median", "Missing"))
             for col in range(1, maxc + 1):
