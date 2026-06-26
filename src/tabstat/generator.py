@@ -164,7 +164,7 @@ class TabStatGenerator:
 
         # ── Optional data quality checks ─────────────────────────────────
         if self.config.check_outliers or self.config.check_multimodal:
-            variables_for_checks, _ = self._parse_formula(df, formula)
+            variables_for_checks, *_ = self._parse_formula(df, formula)
             quality_footnotes = self._run_data_quality_checks(df, variables_for_checks)
             if quality_footnotes:
                 footnote = "\n".join(filter(None, [footnote] + quality_footnotes)) if footnote else "\n".join(quality_footnotes)
@@ -302,7 +302,7 @@ class TabStatGenerator:
         """
         from .rendering import build_col_layout
 
-        variables, group_cols = self._parse_formula(df, formula)
+        variables, group_cols, ordered_items = self._parse_formula(df, formula)
         self._validate_dataframe(df, variables, group_cols)
 
         groups       = self._get_groups(df, group_cols)
@@ -336,12 +336,22 @@ class TabStatGenerator:
                 if first_in_section and first_in_section not in _section_first:
                     _section_first[first_in_section] = sec_label
 
-        for var in variables:
-            # ── Section header (injected before first var of the section) ─
+        for item in ordered_items:
+            # ── Inline section header (formula %Label% tokens) ────
+            if isinstance(item, tuple):
+                _, sec_label = item
+                n_data_cols  = col_layout.n_cols
+                sec_row      = [f"─── {sec_label} ───"] + [""] * (n_data_cols - 1)
+                all_rows.append(sec_row)
+                all_metas.append({"kind": "section", "var": None, "pvalue_span": None})
+                continue
+
+            var = item
+            # ── Section header (config.sections: before first var of section) ─
             if var in _section_first:
                 sec_label   = _section_first[var]
                 n_data_cols = col_layout.n_cols
-                sec_row     = [f"\u2500\u2500\u2500 {sec_label} \u2500\u2500\u2500"] + [""] * (n_data_cols - 1)
+                sec_row     = [f"─── {sec_label} ───"] + [""] * (n_data_cols - 1)
                 all_rows.append(sec_row)
                 all_metas.append({"kind": "section", "var": None, "pvalue_span": None})
 
@@ -576,6 +586,8 @@ class TabStatGenerator:
     # Formula parsing & validation
     # =========================================================================
 
+    _SECTION_TOKEN_RE = re.compile(r"^%(.+)%$")
+
     def _parse_formula(self, df, formula):
         if "|" in formula:
             vars_part, group_part = formula.split("|", 1)
@@ -585,6 +597,9 @@ class TabStatGenerator:
             group_cols = []
 
         vars_part = vars_part.replace("~", "").strip()
+
+        ordered_items: List = []  # str (var name) | ("__section__", label)
+
         if vars_part.startswith("."):
             exclude = set(group_cols)
             rest = vars_part[1:].strip()
@@ -594,8 +609,19 @@ class TabStatGenerator:
                     if excl:
                         exclude.add(excl)
             variables = [c for c in df.columns if c not in exclude]
+            ordered_items = list(variables)
         else:
-            variables = [t.strip() for t in vars_part.split("+") if t.strip()]
+            variables: List[str] = []
+            for token in vars_part.split("+"):
+                token = token.strip()
+                if not token:
+                    continue
+                m = self._SECTION_TOKEN_RE.match(token)
+                if m:
+                    ordered_items.append(("__section__", m.group(1).strip()))
+                else:
+                    ordered_items.append(token)
+                    variables.append(token)
 
         valid_vars   = [v for v in variables  if v in df.columns]
         valid_groups = [g for g in group_cols if g in df.columns]
@@ -605,7 +631,14 @@ class TabStatGenerator:
         if missing_v: logger.warning("Variables not in DataFrame: %s", missing_v)
         if missing_g: logger.warning("Group cols not in DataFrame: %s", missing_g)
 
-        return valid_vars, valid_groups
+        # Drop invalid vars from ordered_items
+        valid_set = set(valid_vars)
+        ordered_items = [
+            item for item in ordered_items
+            if isinstance(item, tuple) or item in valid_set
+        ]
+
+        return valid_vars, valid_groups, ordered_items
 
     def _validate_dataframe(self, df, variables, group_cols):
         if df.columns.duplicated().any():
