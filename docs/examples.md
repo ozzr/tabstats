@@ -354,6 +354,76 @@ t = tabstat(
 
 ---
 
+## Layout presets
+
+A `Layout` controls which columns appear and how rows are assembled.
+Pass a preset name or a `Layout` instance to `layout=`.
+
+```python
+from tabstat import tabstat, Layout
+
+# "standard" — default behavior: metric sub-row for continuous,
+#              n valid shown in Total column header
+t = tabstat(df, "age_months + sex + creatinine | outcome", layout="standard")
+
+# "no_cases" — dedicated N valid column; continuous stat on one inline row
+t = tabstat(df, "age_months + sex + creatinine | outcome", layout="no_cases")
+
+# "compact" — like standard but without the Test column
+t = tabstat(df, "age_months + sex + creatinine | outcome", layout="compact")
+
+# "full" — adds n_valid and SMD columns
+t = tabstat(df, "age_months + sex + creatinine | outcome",
+            layout="full", display_smd=True)
+```
+
+### Fluent builder
+
+Start from any preset and strip or add columns:
+
+```python
+# no_cases without Test column
+layout = Layout.from_preset("no_cases").without_column("test")
+t = tabstat(df, "age_months + sex + creatinine | outcome", layout=layout)
+
+# standard with SMD
+layout = Layout.from_preset("standard").with_column("smd")
+t = tabstat(df, "age_months + sex + creatinine | outcome",
+            layout=layout, display_smd=True)
+
+# chain multiple builder calls
+layout = (
+    Layout.from_preset("full")
+    .without_column("test", "smd")
+    .with_column("n_valid", after="char")
+)
+```
+
+### Custom layout from scratch
+
+Define exactly what each row looks like using the token vocabulary:
+
+```python
+layout = Layout(
+    columns     = ["char", "n_valid", "group", "total", "p"],
+    continuous  = [
+        # one row: label + n_valid + group stats + total + p-value
+        ["char", "n_valid", "group", "total", "p"],
+    ],
+    categorical = [
+        # header row
+        ["char",  "n_valid", "_",     "_",     "p"],
+        # one row per category
+        ["cat",   "_",       "group", "total", "_"],
+    ],
+)
+t = tabstat(df, "age_months + sex + creatinine | outcome", layout=layout)
+```
+
+**Token vocabulary:** `_` · `char` · `n_valid` · `group` · `total` · `p` · `test` · `smd` · `metric` (repeats per metric spec) · `cat` (repeats per category) · `missing`
+
+---
+
 ## Footnote markers
 
 ```python

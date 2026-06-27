@@ -271,4 +271,64 @@ latex_str = gen.to_latex(result_df)
 print("\n  LaTeX preview (first 300 chars):")
 print("  " + latex_str[:300].replace("\n", "\n  "))
 
+
+# -----------------------------------------------------------------------------
+# DEMO G — Layout presets
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("DEMO G — Layout presets")
+print("  standard | no_cases | compact")
+print("=" * 70)
+
+from tabstat import Layout
+
+FORMULA = "age_months + sex + creatinine + grade | outcome"
+LABELS  = {
+    "age_months": "Age (months)",
+    "creatinine": "Creatinine (mg/dL)",
+    "outcome": "Outcome",
+    0: "Survivor",
+    1: "Non-survivor",
+}
+
+print("\n── standard (default) ──")
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS, layout="standard")
+
+print("\n── no_cases (dedicated N valid column; continuous inline) ──")
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS, layout="no_cases")
+
+print("\n── compact (no Test column) ──")
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS, layout="compact")
+
+
+# -----------------------------------------------------------------------------
+# DEMO H — Fluent builder + custom layout from scratch
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("DEMO H — Fluent builder + custom layout")
+print("=" * 70)
+
+# Remove the Test column from no_cases
+layout_no_test = Layout.from_preset("no_cases").without_column("test")
+print(f"\nno_cases.without_column('test'):  columns = {layout_no_test.columns}")
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS, layout=layout_no_test)
+
+# Add SMD to the standard layout
+layout_with_smd = Layout.from_preset("standard").with_column("smd")
+print(f"\nstandard.with_column('smd'):  columns = {layout_with_smd.columns}")
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS,
+        layout=layout_with_smd, display_smd=True)
+
+# Custom from scratch — one stat row per variable, no test column
+print("\n── Custom layout from scratch ──")
+custom = Layout(
+    columns     = ["char", "n_valid", "group", "total", "p"],
+    continuous  = [["char", "n_valid", "group", "total", "p"]],
+    categorical = [
+        ["char",  "n_valid", "_",     "_",     "p"],
+        ["cat",   "_",       "group", "total", "_"],
+    ],
+)
+tabstat(df, FORMULA, tablefmt="grid", column_labels=LABELS, layout=custom)
+
 print("\nDemo complete.")

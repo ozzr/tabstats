@@ -19,7 +19,8 @@ tabstat(
     column_labels  = None,
     title          = None,
     footnote       = None,
-    **kwargs,          # any TabStatConfig field
+    layout         = None,     # str preset name | Layout instance | None
+    **kwargs,                  # any TabStatConfig field
 ) -> pd.DataFrame | str
 ```
 
@@ -38,6 +39,7 @@ output formats derive from the same result object.
 | `column_labels` | `dict` | `None` | Rename variables and/or group values. Keys can be strings, ints, or booleans. |
 | `title` | `str` | `None` | Table title. For text: box above table. For `"df"`: prepended as a row when given. |
 | `footnote` | `str` | `None` | Table footnote. For text: box below table. For `"df"`: appended as a row when given. |
+| `layout` | `str \| Layout \| None` | `None` | Column structure preset (`"standard"`, `"no_cases"`, `"compact"`, `"full"`) or a `Layout` instance. `None` uses the current behavior driven by `TabStatConfig` display flags. |
 | `**kwargs` | — | — | Any field of `TabStatConfig` (see configuration reference), including `column_titles` to rename the Characteristic/Total/P-value/Test/SMD headers. |
 
 ### Formula syntax
@@ -167,6 +169,96 @@ t = tabstat(df, formula, test_overrides=overrides)
 
 ---
 
+## `Layout`
+
+```python
+from tabstat import Layout
+```
+
+Controls which columns appear in the table and how each row type (variable
+header, metric sub-row, category row) is assembled from tokens.
+
+### Token vocabulary
+
+| Token | Meaning |
+|---|---|
+| `_` | Empty cell |
+| `char` | Variable name / label |
+| `n_valid` | N valid (%) for this variable — dedicated column or inline |
+| `group` | Statistic per group — expands to N columns |
+| `total` | Overall statistic or N valid in the Total column |
+| `p` | P-value |
+| `test` | Statistical test name |
+| `smd` | Standardised Mean Difference |
+| `metric` | Metric label for a continuous sub-row (repeats per metric spec) |
+| `cat` | Category label (repeats per category) |
+| `missing` | Missing sub-row (emitted only when missings > 0) |
+
+### Preset factory
+
+```python
+layout = Layout.from_preset("standard")   # default — matches existing output
+layout = Layout.from_preset("no_cases")   # dedicated N valid column; continuous inline
+layout = Layout.from_preset("compact")    # no Test column
+layout = Layout.from_preset("full")       # n_valid + p + test + smd
+
+Layout.available_presets()   # → ["standard", "no_cases", "compact", "full"]
+```
+
+### Fluent builder
+
+```python
+# Remove one or more columns (char, group, total are locked and silently ignored)
+layout = Layout.from_preset("no_cases").without_column("test")
+layout = Layout.from_preset("full").without_column("test", "smd")
+
+# Add a column (inserted at canonical position unless after= is given)
+layout = Layout.from_preset("standard").with_column("smd")
+layout = Layout.from_preset("standard").with_column("n_valid", after="char")
+
+# Replace row templates
+layout = Layout.from_preset("standard").continuous_rows(
+    ["char", "n_valid", "group", "total", "p", "test"],
+)
+```
+
+### Constructor (custom from scratch)
+
+```python
+layout = Layout(
+    columns     = ["char", "n_valid", "group", "total", "p"],
+    continuous  = [["char", "n_valid", "group", "total", "p"]],   # inline row
+    categorical = [
+        ["char",  "n_valid", "_",     "_",     "p"],   # header
+        ["cat",   "_",       "group", "total", "_"],   # per category
+    ],
+)
+```
+
+Each row template is a list of tokens — one per logical column in the same order as
+`columns`.  The `group` logical column expands to one physical column per group
+(×2 when `split_count_pct=True`).
+
+### Usage
+
+```python
+from tabstat import tabstat, Layout
+
+# Preset name string
+tabstat(df, "age + sex | outcome", layout="no_cases")
+
+# Layout instance
+layout = Layout.from_preset("no_cases").without_column("test")
+tabstat(df, "age + sex | outcome", layout=layout)
+
+# With TabStatGenerator
+from tabstat import TabStatGenerator, TabStatConfig
+gen = TabStatGenerator(TabStatConfig(display_missing=True))
+gen.generate(df, "age + sex | outcome", layout="compact")
+```
+
+---
+
 ## `TabStatGenerator`
 
 ```python
@@ -191,6 +283,7 @@ gen.generate(
     title          = None,
     footnote       = None,
     show           = True,
+    layout         = None,     # str preset name | Layout instance | None
 ) -> pd.DataFrame | str
 ```
 

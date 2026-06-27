@@ -16,6 +16,7 @@
 | Auto test selection | Shapiro-Wilk / D'Agostino / moment-based normality → t-test, Welch, Mann-Whitney U, ANOVA, Kruskal-Wallis, Fisher, Chi-squared, McNemar |
 | Multi-level grouping | `"age + sex \| site + outcome"` — nested group headers |
 | Output formats | DataFrame · grid text · markdown · LaTeX · HTML · Excel · Word (DOCX) |
+| **Layout presets** | `"standard"` · `"no_cases"` · `"compact"` · `"full"` — control which columns appear and how rows are assembled |
 | Custom continuous stats | `"Median [IQR] = median [p25, p75]"` template DSL |
 | Multiple testing correction | Bonferroni · Benjamini-Hochberg FDR |
 | Section headers | Group variables under labelled sections |
@@ -306,6 +307,57 @@ t = tabstat(df, "age + sex + creatinine | outcome",
 
 ---
 
+## Layout presets
+
+A `Layout` controls **which columns appear** and **how rows are assembled**
+for continuous and categorical variables.  Pass a preset name or a `Layout`
+instance to `layout=`.
+
+```python
+from tabstat import tabstat, Layout
+
+# Built-in presets
+tabstat(df, "age + sex | outcome", layout="standard")   # default behavior
+tabstat(df, "age + sex | outcome", layout="no_cases")   # dedicated N valid column;
+                                                        # continuous stats inline
+tabstat(df, "age + sex | outcome", layout="compact")    # no Test column
+tabstat(df, "age + sex | outcome", layout="full")       # + n_valid + SMD columns
+```
+
+### Fluent builder
+
+Start from any preset and strip or add columns:
+
+```python
+layout = Layout.from_preset("no_cases").without_column("test")
+tabstat(df, "age + sex | outcome", layout=layout)
+
+layout = Layout.from_preset("standard").with_column("smd")
+tabstat(df, "age + sex | outcome", layout=layout, display_smd=True)
+```
+
+### Custom from scratch
+
+```python
+from tabstat import Layout
+
+layout = Layout(
+    columns     = ["char", "n_valid", "group", "total", "p"],
+    continuous  = [["char", "n_valid", "group", "total", "p"]],   # inline row
+    categorical = [
+        ["char",  "n_valid", "_",     "_",     "p"],              # header
+        ["cat",   "_",       "group", "total", "_"],              # per category
+    ],
+)
+tabstat(df, "age + sex | outcome", layout=layout)
+```
+
+**Token vocabulary:** `_` · `char` · `n_valid` · `group` · `total` · `p` · `test` · `smd` · `metric` · `cat` · `missing`
+
+Available presets: `Layout.available_presets()` → `["standard", "no_cases", "compact", "full"]`
+
+---
+
 ## Exports
 
 ### HTML
@@ -478,10 +530,11 @@ Valid test tokens:
 tabstat/
   __init__.py      tabstat() convenience function, export_tables_to_excel()
   config.py        TabStatConfig, TestOverrideConfig
+  layouts.py       Layout, RowTemplate — column structure presets & fluent builder
   generator.py     TabStatGenerator — core analysis pipeline
   normality.py     NormalitySelector — automatic normality test selection
   resolver.py      TestResolver — hierarchical test override resolution
-  rendering.py     Canvas-based text table renderer
+  rendering.py     Canvas-based text table renderer, ColLayout
   exports.py       to_html_str(), to_excel_file(), to_docx_file(),
                    apply_publication_style()
 ```
