@@ -96,6 +96,7 @@ class TabStatGenerator:
         title: Optional[str] = None,
         footnote: Optional[str] = None,
         show: bool = True,
+        layout=None,   # str | Layout | None
     ) -> Union[pd.DataFrame, str]:
         """
         Run analysis once and return result in the requested format.
@@ -119,10 +120,12 @@ class TabStatGenerator:
         """
         from .rendering import build_col_layout, render_text_table
 
+        resolved_layout = self._resolve_layout(layout)
+
         # ── Single analysis run ───────────────────────────────────────────
         (result_df, row_metas, col_layout,
          group_cols, groups, group_counts) = self._run_analysis(
-            df, formula, column_labels, paired
+            df, formula, column_labels, paired, layout=resolved_layout
         )
 
         # ── SMD with >2 groups: warn, column is meaningless ─────────────────
@@ -292,6 +295,7 @@ class TabStatGenerator:
         formula: str,
         column_labels: Optional[Dict[str, str]],
         paired: bool,
+        layout=None,
     ) -> Tuple:
         """
         Execute the full statistical pipeline.
@@ -300,7 +304,7 @@ class TabStatGenerator:
         -------
         (result_df, row_metas, col_layout, group_cols, groups, group_counts)
         """
-        from .rendering import build_col_layout
+        from .rendering import build_col_layout, col_layout_from_layout
 
         variables, group_cols, ordered_items = self._parse_formula(df, formula)
         self._validate_dataframe(df, variables, group_cols)
@@ -310,16 +314,19 @@ class TabStatGenerator:
 
         _var_labels, _val_maps = self._parse_column_labels(column_labels)
 
-        col_layout = build_col_layout(
-            group_cols        = group_cols,
-            groups            = groups,
-            display_overall   = self.config.display_overall,
-            overall_position  = self.config.overall_position,
-            display_p_values  = self.config.display_p_values,
-            display_test_name = self.config.display_test_name,
-            display_smd       = self.config.display_smd,
-            split_count_pct   = self.config.split_count_pct,
-        )
+        if layout is not None:
+            col_layout = col_layout_from_layout(layout, groups, self.config.split_count_pct)
+        else:
+            col_layout = build_col_layout(
+                group_cols        = group_cols,
+                groups            = groups,
+                display_overall   = self.config.display_overall,
+                overall_position  = self.config.overall_position,
+                display_p_values  = self.config.display_p_values,
+                display_test_name = self.config.display_test_name,
+                display_smd       = self.config.display_smd,
+                split_count_pct   = self.config.split_count_pct,
+            )
 
         all_rows:    List[List[Any]] = []
         all_metas:   List[Dict]      = []
@@ -358,7 +365,19 @@ class TabStatGenerator:
             try:
                 vtype      = self._get_render_type(df, var)
                 _is_paired = paired or var in self.config.paired_vars
-                if vtype == "numeric":
+                if layout is not None:
+                    if vtype == "numeric":
+                        var_rows, var_metas = self._summarize_numeric_layout(
+                            df, var, group_cols, groups, layout,
+                            paired=_is_paired, var_label=_var_labels.get(var),
+                        )
+                    else:
+                        var_rows, var_metas = self._summarize_categorical_layout(
+                            df, var, group_cols, groups, layout,
+                            paired=_is_paired, var_label=_var_labels.get(var),
+                            val_map=_val_maps.get(var),
+                        )
+                elif vtype == "numeric":
                     var_rows, var_metas = self._summarize_numeric(
                         df, var, group_cols, groups, paired=_is_paired,
                         var_label=_var_labels.get(var),
@@ -426,7 +445,10 @@ class TabStatGenerator:
                             row[p_col_idx] = p_fmt
 
         # Build DataFrame
-        columns   = self._build_columns(df, group_cols, groups, group_counts)
+        if layout is not None:
+            columns = self._build_columns_from_layout(df, layout, group_cols, groups, group_counts)
+        else:
+            columns = self._build_columns(df, group_cols, groups, group_counts)
         n_cols    = len(columns)
         norm_rows = self._normalize_rows(all_rows, n_cols)
         result_df = pd.DataFrame(norm_rows, columns=columns)
@@ -1140,6 +1162,535 @@ class TabStatGenerator:
         if group_cols and cfg.display_smd:
             row.append("")
         return row
+
+    # =========================================================================
+    # Layout system — preset resolver + row/column builders
+    # =========================================================================
+
+    def _resolve_layout(self, layout_param):
+        """Resolve layout param: str → preset, Layout instance → as-is, None → None."""
+        if layout_param is None:
+            return None
+        from .layouts import Layout
+        if isinstance(layout_param, str):
+            return Layout.from_preset(layout_param)
+        if hasattr(layout_param, "columns") and hasattr(layout_param, "continuous"):
+            return layout_param
+        raise TypeError(
+            f"layout must be a str preset name, a Layout instance, or None; "
+            f"got {type(layout_param).__name__}"
+        )
+
+    def _resolve_token(self, token: str, ctx: Dict[str, str]) -> str:
+        """Map a single layout token to its string value using ctx."""
+        if token in ("_", None, ""):
+            return ""
+        if token == "char":
+            return ctx.get("char_val", "")
+        if token == "n_valid":
+            return ctx.get("n_valid_str", "")
+        if token == "total":
+            return ctx.get("total_val", "")
+        if token == "p":
+            return ctx.get("p_str", "")
+        if token == "test":
+            return ctx.get("test_str", "")
+        if token == "smd":
+            return ctx.get("smd_str", "")
+        if token == "metric":
+            return self._indent(ctx.get("metric_label", ""))
+        if token == "cat":
+            return self._indent(ctx.get("cat_label", ""))
+        if token == "missing":
+            return self._indent("Missing")
+        return ""
+
+    def _build_layout_row(
+        self,
+        tmpl,
+        layout,
+        groups: List[Any],
+        grp_stat_cells: List[str],
+        grp_n_cells:    List[str],
+        grp_pct_cells:  List[str],
+        ctx:            Dict[str, str],
+        is_cat:         bool = False,
+    ) -> List[str]:
+        """
+        Build one concrete data row from a RowTemplate.
+
+        grp_stat_cells : combined "n (pct%)" strings, one per group (non-split mode)
+        grp_n_cells    : raw count strings, one per group (split mode, categorical)
+        grp_pct_cells  : pct strings, one per group (split mode, categorical)
+        is_cat         : True for category rows (split mode % handling differs)
+        """
+        cfg = self.config
+        row: List[str] = []
+
+        for i, col_id in enumerate(layout.columns):
+            token = tmpl.token_at(i)
+
+            if col_id == "group":
+                if token == "group":
+                    if cfg.split_count_pct:
+                        if is_cat:
+                            for n_v, pct_v in zip(grp_n_cells, grp_pct_cells):
+                                row.append(str(n_v))
+                                row.append(pct_v)
+                        else:
+                            for stat_v in grp_stat_cells:
+                                row.append(stat_v)
+                                row.append("")   # empty % cell for numeric
+                    else:
+                        row.extend(grp_stat_cells)
+                else:
+                    n_grp_cells = len(groups) * (2 if cfg.split_count_pct else 1)
+                    row.extend([""] * n_grp_cells)
+
+            elif col_id == "total":
+                if cfg.split_count_pct:
+                    if token in ("total", "n_valid"):
+                        if is_cat:
+                            row.append(ctx.get("total_n", ""))
+                            row.append(ctx.get("total_pct", ""))
+                        else:
+                            row.append(ctx.get("total_val", ""))
+                            row.append("")   # empty % for numeric
+                    else:
+                        row.append("")
+                        row.append("")
+                else:
+                    row.append(self._resolve_token(token, ctx))
+
+            else:
+                row.append(self._resolve_token(token, ctx))
+
+        return row
+
+    def _make_missing_row_for_layout(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        groups: List[Any],
+        layout,
+    ) -> Optional[List[str]]:
+        """Build the Missing sub-row using the layout's column order."""
+        cfg    = self.config
+        n_miss = int(df[var].isna().sum())
+        if n_miss == 0:
+            return None
+        n_total = len(df)
+        pct_ov  = (n_miss / n_total * 100) if n_total > 0 else 0.0
+
+        row: List[str] = []
+        for col_id in layout.columns:
+            if col_id == "char":
+                row.append(self._indent("Missing"))
+            elif col_id == "n_valid":
+                row.append("")
+            elif col_id == "group":
+                for g_tuple in groups:
+                    mask     = self._get_group_mask(df, group_cols, g_tuple)
+                    sub      = df.loc[mask, var]
+                    n_miss_g = int(sub.isna().sum())
+                    pct_g    = (n_miss_g / len(sub) * 100) if len(sub) > 0 else 0.0
+                    if cfg.split_count_pct:
+                        row.append(str(n_miss_g))
+                        row.append(f"{pct_g:.{cfg.decimals}f}%")
+                    else:
+                        row.append(f"{n_miss_g} ({pct_g:.{cfg.decimals}f}%)")
+            elif col_id == "total":
+                if cfg.split_count_pct:
+                    row.append(str(n_miss))
+                    row.append(f"{pct_ov:.{cfg.decimals}f}%")
+                else:
+                    row.append(f"{n_miss} ({pct_ov:.{cfg.decimals}f}%)")
+            else:
+                row.append("")
+        return row
+
+    def _summarize_numeric_layout(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        groups: List[Any],
+        layout,
+        paired: bool = False,
+        var_label: Optional[str] = None,
+    ) -> Tuple[List[List[Any]], List[Dict]]:
+        """Layout-driven numeric summarization. Returns (rows, metas)."""
+        cfg           = self.config
+        specs         = self._get_render_specs(var)
+        resolved_test = self.test_resolver.resolve(var, group_cols, "numeric")
+        _marker       = cfg.var_footnotes.get(var, "")
+        _label        = f"{var_label or var}{_marker}"
+        n_valid_str   = self._calc_overall_header(df, var)
+
+        # Pre-compute group series
+        group_series: List[pd.Series] = []
+        for g_tuple in groups:
+            mask = self._get_group_mask(df, group_cols, g_tuple)
+            group_series.append(df.loc[mask, var].dropna())
+
+        # P-value and SMD
+        raw_p = None
+        p_str = test_str = smd_str = ""
+        if group_cols:
+            p, test = self._calculate_pvalue_numeric(group_series, resolved_test, paired)
+            raw_p   = p
+            p_str   = self._format_p(p)
+            test_str = test
+        if group_cols and cfg.display_smd and len(groups) == 2:
+            smd_str = self._compute_smd_numeric(group_series[0], group_series[1])
+
+        default_metric = cfg.render_config.get(var, cfg.render_config.get("default_numeric", "median_iqr"))
+        default_label  = "Mean (SD)" if default_metric == "mean_sd" else "Median [IQR]"
+
+        rows:  List[List[Any]] = []
+        metas: List[Dict]      = []
+
+        group_ci  = layout.col_idx("group")
+
+        for tmpl in layout.continuous:
+            rtype     = tmpl.repeat_type
+            group_tok = (tmpl.tokens[group_ci]
+                         if group_ci is not None and group_ci < len(tmpl.tokens)
+                         else "_")
+
+            if rtype == "metric":
+                # Emit one sub-row per metric spec (or the default metric once)
+                if specs:
+                    for sidx, spec in enumerate(specs):
+                        if " = " not in spec:
+                            continue
+                        lbl, formula  = spec.split(" = ", 1)
+                        total_val     = self._compute_stat(df[var].dropna(), formula)
+                        grp_stat      = [
+                            self._compute_stat(gs, formula)
+                            if len(gs) > 0 else cfg.missing_value_symbol
+                            for gs in group_series
+                        ]
+                        ctx = {
+                            "metric_label": lbl.strip(),
+                            "n_valid_str":  n_valid_str,
+                            "total_val":    total_val,
+                            "p_str":   p_str   if sidx == 0 else "",
+                            "test_str": test_str if sidx == 0 else "",
+                            "smd_str":  smd_str  if sidx == 0 else "",
+                        }
+                        row = self._build_layout_row(tmpl, layout, groups, grp_stat, [], [], ctx)
+                        rows.append(row)
+                        metas.append({"kind": "stat", "var": var, "pvalue_span": None,
+                                      "raw_p": raw_p if sidx == 0 else None})
+                else:
+                    total_val = self._format_numeric_stats(df[var].dropna(), default_metric)
+                    grp_stat  = [
+                        self._format_numeric_stats(gs, default_metric)
+                        if len(gs) > 0 else cfg.missing_value_symbol
+                        for gs in group_series
+                    ]
+                    ctx = {
+                        "metric_label": default_label,
+                        "n_valid_str":  n_valid_str,
+                        "total_val":    total_val,
+                        "p_str":   p_str, "test_str": test_str, "smd_str": smd_str,
+                    }
+                    row = self._build_layout_row(tmpl, layout, groups, grp_stat, [], [], ctx)
+                    rows.append(row)
+                    metas.append({"kind": "stat", "var": var, "pvalue_span": None, "raw_p": raw_p})
+
+            elif rtype is None and group_tok == "group":
+                # Inline stat row (e.g., no_cases: stats on same line as label)
+                if specs and " = " in specs[0]:
+                    lbl, formula = specs[0].split(" = ", 1)
+                    total_val    = self._compute_stat(df[var].dropna(), formula)
+                    grp_stat     = [
+                        self._compute_stat(gs, formula)
+                        if len(gs) > 0 else cfg.missing_value_symbol
+                        for gs in group_series
+                    ]
+                else:
+                    total_val = self._format_numeric_stats(df[var].dropna(), default_metric)
+                    grp_stat  = [
+                        self._format_numeric_stats(gs, default_metric)
+                        if len(gs) > 0 else cfg.missing_value_symbol
+                        for gs in group_series
+                    ]
+                ctx = {
+                    "char_val":    _label,
+                    "n_valid_str": n_valid_str,
+                    "total_val":   total_val,
+                    "p_str":   p_str, "test_str": test_str, "smd_str": smd_str,
+                }
+                row = self._build_layout_row(tmpl, layout, groups, grp_stat, [], [], ctx)
+                rows.append(row)
+                metas.append({"kind": "var_header", "var": var, "pvalue_span": None, "raw_p": raw_p})
+
+            elif rtype is None:
+                # Pure header row (no group stats)
+                ctx = {
+                    "char_val":    _label,
+                    "n_valid_str": n_valid_str,
+                    "total_val":   n_valid_str,  # header: total column shows n_valid
+                    "p_str": "", "test_str": "", "smd_str": "",
+                }
+                row = self._build_layout_row(
+                    tmpl, layout, groups, [""] * len(groups), [], [], ctx)
+                rows.append(row)
+                metas.append({"kind": "var_header", "var": var, "pvalue_span": None})
+
+            elif rtype == "missing":
+                miss = self._make_missing_row_for_layout(df, var, group_cols, groups, layout)
+                if miss is not None:
+                    rows.append(miss)
+                    metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        # Auto-add missing row when cfg.display_missing and no explicit missing template
+        if cfg.display_missing and not any(t.repeat_type == "missing" for t in layout.continuous):
+            miss = self._make_missing_row_for_layout(df, var, group_cols, groups, layout)
+            if miss is not None:
+                rows.append(miss)
+                metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        return rows, metas
+
+    def _summarize_categorical_layout(
+        self,
+        df: pd.DataFrame,
+        var: str,
+        group_cols: List[str],
+        groups: List[Any],
+        layout,
+        paired: bool = False,
+        var_label: Optional[str] = None,
+        val_map: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[List[Any]], List[Dict]]:
+        """Layout-driven categorical summarization. Returns (rows, metas)."""
+        cfg     = self.config
+        val_map = val_map or {}
+
+        # NaN handling
+        if cfg.include_nan_as_category:
+            working_col = f"__tabstat_nan_{var}__"
+            df = df.copy()
+            df[working_col] = df[var].fillna(cfg.nan_category_label).astype(str)
+            _var_for_ops = working_col
+        else:
+            _var_for_ops = var
+
+        series = (df[_var_for_ops].dropna() if not cfg.include_nan_as_category
+                  else df[_var_for_ops])
+        if hasattr(series, "cat") and series.cat.ordered:
+            present    = set(series.unique())
+            categories = [c for c in series.cat.categories if c in present]
+        else:
+            try:    categories = sorted(series.unique(), key=self._natural_key)
+            except: categories = sorted(str(c) for c in series.unique())
+
+        is_binary     = len(categories) == 2
+        n_valid_str   = self._calc_overall_header(df, var)
+        n_valid_total = (len(df) if cfg.include_nan_as_category
+                         else int(df[_var_for_ops].count()))
+        resolved_test = self.test_resolver.resolve(var, group_cols, "categorical")
+
+        p_value, test_name = np.nan, ""
+        if group_cols:
+            p_value, test_name = self._calculate_pvalue_categorical(
+                df, _var_for_ops, group_cols, resolved_test, paired)
+        p_str = self._format_p(p_value) if group_cols else ""
+
+        smd_str = ""
+        if group_cols and cfg.display_smd and is_binary and len(groups) == 2:
+            ref_cat = categories[-1]
+            s1 = df.loc[self._get_group_mask(df, group_cols, groups[0]), _var_for_ops].dropna()
+            s2 = df.loc[self._get_group_mask(df, group_cols, groups[1]), _var_for_ops].dropna()
+            p1 = (s1 == ref_cat).sum() / len(s1) if len(s1) > 0 else 0.0
+            p2 = (s2 == ref_cat).sum() / len(s2) if len(s2) > 0 else 0.0
+            smd_str = self._compute_smd_binary(p1, p2)
+
+        parent_counts: Dict[Any, int] = {}
+        if cfg.pct_denominator == "parent_group" and len(group_cols) > 1:
+            parent_col = group_cols[0]
+            for g in groups:
+                parent_key  = g[0] if isinstance(g, tuple) else g
+                parent_mask = df[parent_col] == parent_key
+                parent_counts[g] = int(df.loc[parent_mask, _var_for_ops].count())
+
+        _marker = cfg.var_footnotes.get(var, "")
+        _label  = f"{var_label or var}{_marker}"
+
+        rows:  List[List[Any]] = []
+        metas: List[Dict]      = []
+
+        for tmpl in layout.categorical:
+            rtype = tmpl.repeat_type
+
+            if rtype is None:
+                # Header row — detect if layout wants p/test here
+                p_col_idx   = layout.col_idx("p")
+                header_has_p = (p_col_idx is not None
+                                and p_col_idx < len(tmpl.tokens)
+                                and tmpl.tokens[p_col_idx] == "p")
+                ctx = {
+                    "char_val":    _label,
+                    "n_valid_str": n_valid_str,
+                    "total_val":   n_valid_str,
+                    "p_str":    "",   # filled by pvalue_span or _decorate_df_output
+                    "test_str": "",
+                    "smd_str":  smd_str,
+                }
+                row = self._build_layout_row(
+                    tmpl, layout, groups, [""] * len(groups), [], [], ctx)
+                rows.append(row)
+                span = None
+                if group_cols and header_has_p and len(categories) >= 1:
+                    span = (p_str, test_name, 1, len(categories))
+                metas.append({"kind": "var_header", "var": var, "pvalue_span": span,
+                              "raw_p": p_value if group_cols else None})
+
+            elif rtype == "category":
+                for cat in categories:
+                    n_cat_tot = int((df[_var_for_ops] == cat).sum())
+                    pct_tot   = (n_cat_tot / n_valid_total * 100) if n_valid_total > 0 else 0.0
+                    grp_stat, grp_n, grp_pct = [], [], []
+                    for g_tuple in groups:
+                        mask  = self._get_group_mask(df, group_cols, g_tuple)
+                        sub   = df.loc[mask, _var_for_ops]
+                        denom = self._get_cat_denom(df, _var_for_ops, group_cols, g_tuple, parent_counts)
+                        n_gc  = int((sub == cat).sum())
+                        pct   = (n_gc / denom * 100) if denom > 0 else 0.0
+                        grp_n.append(str(n_gc))
+                        grp_pct.append(f"{pct:.{cfg.decimals}f}%")
+                        grp_stat.append(self._format_cat_cell(n_gc, denom, var))
+                    ctx = {
+                        "cat_label":   val_map.get(str(cat), str(cat)),
+                        "n_valid_str": "",
+                        "total_val":   f"{n_cat_tot} ({pct_tot:.{cfg.decimals}f}%)",
+                        "total_n":     str(n_cat_tot),
+                        "total_pct":   f"{pct_tot:.{cfg.decimals}f}%",
+                        "p_str": "", "test_str": "", "smd_str": "",
+                    }
+                    row = self._build_layout_row(
+                        tmpl, layout, groups, grp_stat, grp_n, grp_pct, ctx, is_cat=True)
+                    rows.append(row)
+                    metas.append({"kind": "category", "var": var, "pvalue_span": None})
+
+            elif rtype == "missing":
+                miss = self._make_missing_row_for_layout(df, var, group_cols, groups, layout)
+                if miss is not None:
+                    rows.append(miss)
+                    metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        # Auto-add missing row
+        if cfg.display_missing and not any(t.repeat_type == "missing" for t in layout.categorical):
+            miss = self._make_missing_row_for_layout(df, var, group_cols, groups, layout)
+            if miss is not None:
+                rows.append(miss)
+                metas.append({"kind": "missing", "var": var, "pvalue_span": None})
+
+        return rows, metas
+
+    def _build_columns_from_layout(
+        self,
+        df: pd.DataFrame,
+        layout,
+        group_cols: List[str],
+        groups: List[Any],
+        group_counts: Dict[Any, int],
+    ):
+        """Build the pandas MultiIndex (or flat Index) from a Layout instance."""
+        cfg  = self.config
+        t    = self._titles()
+        cols: List = []
+
+        is_single_group = len(group_cols) == 1
+        gc_name = group_cols[0] if group_cols else ""
+
+        for col_id in layout.columns:
+            if col_id == "char":
+                if not group_cols:
+                    cols.append((t["characteristic"],))
+                elif is_single_group:
+                    x = ("",) if cfg.split_count_pct else ()
+                    cols.append((t["characteristic"], "") + x)
+                else:
+                    pad = ("",) * len(group_cols) + (("",) if cfg.split_count_pct else ())
+                    cols.append((t["characteristic"],) + pad)
+
+            elif col_id == "n_valid":
+                if not group_cols:
+                    cols.append(("N valid",))
+                elif is_single_group:
+                    x = ("",) if cfg.split_count_pct else ()
+                    cols.append(("N valid", "") + x)
+                else:
+                    pad = ("",) * len(group_cols) + (("",) if cfg.split_count_pct else ())
+                    cols.append(("N valid",) + pad)
+
+            elif col_id == "group":
+                for g in groups:
+                    n = group_counts.get(g, "?")
+                    if is_single_group:
+                        g_label = f"{g} (n={n})"
+                        if cfg.split_count_pct:
+                            cols.append((gc_name, g_label, "n"))
+                            cols.append((gc_name, g_label, "%"))
+                        else:
+                            cols.append((gc_name, g_label))
+                    else:
+                        g_label = f"(n={n})"
+                        if cfg.split_count_pct:
+                            cols.append(g + (g_label, "n"))
+                            cols.append(g + (g_label, "%"))
+                        else:
+                            cols.append(g + (g_label,))
+
+            elif col_id == "total":
+                if not group_cols:
+                    cols.append((f"{t['total']} (n={len(df)})",))
+                elif is_single_group:
+                    if cfg.split_count_pct:
+                        cols.append((t["total"], f"(n={len(df)})", "n"))
+                        cols.append((t["total"], f"(n={len(df)})", "%"))
+                    else:
+                        cols.append((t["total"], f"(n={len(df)})"))
+                else:
+                    pad = ("",) * len(group_cols)
+                    if cfg.split_count_pct:
+                        cols.append((t["total"],) + pad + ("n",))
+                        cols.append((t["total"],) + pad + ("%",))
+                    else:
+                        cols.append((t["total"],) + pad)
+
+            elif col_id == "p" and group_cols:
+                if is_single_group:
+                    x = ("",) if cfg.split_count_pct else ()
+                    cols.append((t["p_value"], "") + x)
+                else:
+                    xpad = ("",) * len(group_cols) + (("",) if cfg.split_count_pct else ())
+                    cols.append((t["p_value"],) + xpad)
+
+            elif col_id == "test" and group_cols:
+                if is_single_group:
+                    x = ("",) if cfg.split_count_pct else ()
+                    cols.append((t["test"], "") + x)
+                else:
+                    xpad = ("",) * len(group_cols) + (("",) if cfg.split_count_pct else ())
+                    cols.append((t["test"],) + xpad)
+
+            elif col_id == "smd" and group_cols:
+                if is_single_group:
+                    x = ("",) if cfg.split_count_pct else ()
+                    cols.append((t["smd"], "") + x)
+                else:
+                    pad = ("",) * len(group_cols)
+                    cols.append((t["smd"],) + pad)
+
+        if not group_cols:
+            return pd.Index([c[0] for c in cols])
+        return pd.MultiIndex.from_tuples(cols)
 
     # =========================================================================
     # Column index construction

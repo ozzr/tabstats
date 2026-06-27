@@ -33,6 +33,7 @@ import pandas as pd
 class ColLayout:
     n_cols:          int
     char_idx:        int                  = 0
+    n_valid_idx:     Optional[int]        = None   # dedicated N valid column
     total_idx:       Optional[int]        = None
     group_idxs:      List[int]            = field(default_factory=list)
     p_idx:           Optional[int]        = None
@@ -82,6 +83,48 @@ def build_col_layout(
 
     layout.n_cols = idx
     return layout
+
+
+def col_layout_from_layout(tab_layout: Any, groups: List[Any],
+                           split_count_pct: bool = False) -> ColLayout:
+    """
+    Derive a ColLayout from a tabstat Layout instance.
+
+    Each logical column in *tab_layout.columns* maps to one (or more)
+    physical data columns:
+      "group"  → len(groups) * (2 if split_count_pct else 1) columns
+      "total"  → 2 columns when split_count_pct, else 1
+      others   → 1 column each
+    """
+    cpt = 2 if split_count_pct else 1
+    lay = ColLayout(n_cols=0, split_count_pct=split_count_pct)
+    idx = 1   # col 0 is always char
+
+    for col_id in tab_layout.columns:
+        if col_id == "char":
+            lay.char_idx = 0   # always 0; already set
+        elif col_id == "n_valid":
+            lay.n_valid_idx = idx
+            idx += 1
+        elif col_id == "group":
+            if groups:
+                lay.group_idxs = list(range(idx, idx + len(groups) * cpt, cpt))
+                idx += len(groups) * cpt
+        elif col_id == "total":
+            lay.total_idx = idx
+            idx += (2 if split_count_pct else 1)
+        elif col_id == "p":
+            lay.p_idx = idx
+            idx += 1
+        elif col_id == "test":
+            lay.test_idx = idx
+            idx += 1
+        elif col_id == "smd":
+            lay.smd_idx = idx
+            idx += 1
+
+    lay.n_cols = idx
+    return lay
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,12 +251,14 @@ def _render_footnote(footnote: str, table_width: int) -> str:
 
 def _label_sep_row(lay: ColLayout, n_total: int,
                    fill: str = "=", total_show_n: bool = False) -> List[SCell]:
-    """Standard label-separator: Characteristic / Total / p-val / etc."""
+    """Standard label-separator: Characteristic / N valid / Total / p-val / etc."""
     cells: List[SCell] = []
     col = 0
     while col < lay.n_cols:
         if col == lay.char_idx:
             cells.append(SCell(fill, "Characteristic")); col += 1
+        elif lay.n_valid_idx is not None and col == lay.n_valid_idx:
+            cells.append(SCell(fill, "N valid")); col += 1
         elif lay.total_idx is not None and col == lay.total_idx:
             lbl = f"Total (n={n_total})" if total_show_n else "Total"
             span = 2 if lay.split_count_pct else 1

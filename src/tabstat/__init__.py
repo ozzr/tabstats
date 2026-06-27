@@ -37,6 +37,7 @@ from .normality import NormalitySelector
 from .resolver  import TestResolver
 from .generator import TabStatGenerator
 from .exports   import apply_publication_style
+from .layouts   import Layout
 
 __all__ = [
     "tabstat",
@@ -45,6 +46,7 @@ __all__ = [
     "TestOverrideConfig",
     "NormalitySelector",
     "TestResolver",
+    "Layout",
     "export_tables_to_excel",
     "apply_publication_style",
 ]
@@ -65,6 +67,7 @@ def tabstat(
     column_labels:  Optional[Dict[str, str]]    = None,
     title:          Optional[str]               = None,
     footnote:       Optional[str]               = None,
+    layout=None,                                          # str | Layout | None
     # ── TabStatConfig fields (forwarded via **kwargs) ─────────────────────
     **kwargs,
 ) -> Union[pd.DataFrame, str]:
@@ -186,6 +189,7 @@ def tabstat(
         title          = title,
         footnote       = footnote,
         show           = show,
+        layout         = layout,
     )
 
 def export_tables_to_excel(
